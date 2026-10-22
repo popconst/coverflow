@@ -34,8 +34,12 @@ album by its cover, press Enter, and the other client shows it playing.
 
 - **The fold:** neighbours are turned towards the centre like the original
   Cover Flow: each is squeezed into a trapezoid, full height at the edge
-  nearest the centre, shorter and darker towards the far edge, and darker the
-  further out it sits.
+  nearest the centre, shorter and darker towards the far edge, overlapping
+  the one behind it, and darker the further out it sits.
+- **The glide:** flipping slides the whole row to the new album, easing out,
+  at about 60 frames a second; covers turn as they leave or reach the centre.
+  Each turned version of a cover is made once and reused, and moving an image
+  the terminal already has costs next to nothing, so it stays smooth.
 - **Albums** are the folders in MPD's library that hold tagged songs, with
   disc folders (`CD1/`, `Disc 2/`, …) folded into their album and `Playlists/`
   folders left out; sorted by album artist, year and title.
