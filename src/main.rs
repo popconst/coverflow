@@ -2,11 +2,16 @@
 //! in the terminal. Plays alongside any other MPD client (rmpc, ncmpcpp…).
 
 mod covers;
+mod fold;
 mod library;
 mod mpd;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
+use fold::Facing;
 use image::DynamicImage;
 use library::Album;
 use ratatui::{
@@ -20,13 +25,18 @@ use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const HELP: &str = "h/l ←/→ flip · H/L ±10 · g/G ends · / search · c playing · ⏎ play · a add · q quit";
-/// Size of each neighbour relative to the centre cover, going outwards
-const SIDE_SCALES: [f32; 3] = [0.72, 0.52, 0.38];
+const HELP: &str =
+    "h/l ←/→ scroll flip · H/L ±10 · g/G ends · / search · c playing · ⏎ play · a add · q quit";
+/// Height of the folded side covers compared with the centre one
+const SIDE_HEIGHT: f32 = 0.86;
+/// Most folded covers drawn on each side
+const MAX_SIDE: usize = 8;
+/// Fastest a scroll wheel or trackpad flips: one album per this long
+const SCROLL_STEP: Duration = Duration::from_millis(60);
 /// How far around the selection covers are loaded ahead of time
-const PREFETCH: usize = 6;
+const PREFETCH: usize = MAX_SIDE + 2;
 /// Covers further than this from the selection are dropped from memory
 const KEEP: usize = 40;
 
@@ -35,6 +45,13 @@ struct Options {
     music_dir: PathBuf,
     /// print the album list and exit
     list: bool,
+}
+
+/// How a cover is shown: flat in the centre, or folded n places out
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum View {
+    Flat,
+    Folded(Facing, usize),
 }
 
 enum Mode {
@@ -53,8 +70,12 @@ struct App {
     loader: covers::Loader,
     /// Loaded covers; None when an album has none
     images: HashMap<usize, Option<DynamicImage>>,
-    /// Encoded images per (album, dimmed); re-encoded only when their size changes
-    protocols: HashMap<(usize, bool), StatefulProtocol>,
+    /// Encoded images per album and how it's shown; re-encoded only when
+    /// their size changes
+    protocols: HashMap<(usize, View), StatefulProtocol>,
+    /// Where each cover was drawn last, for mouse clicks
+    hits: Vec<(Rect, usize)>,
+    last_scroll: Instant,
     requested: HashSet<usize>,
     status: Option<String>,
 }
@@ -93,10 +114,14 @@ fn main() -> Result<()> {
         loader: covers::Loader::spawn(cache_dir),
         images: HashMap::new(),
         protocols: HashMap::new(),
+        hits: Vec::new(),
+        last_scroll: Instant::now(),
         requested: HashSet::new(),
         status: None,
     };
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = app.run(&mut terminal);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -160,18 +185,19 @@ impl App {
             }
             while let Ok(loaded) = self.loader.results.try_recv() {
                 self.images.insert(loaded.index, loaded.image);
-                self.protocols.remove(&(loaded.index, false));
-                self.protocols.remove(&(loaded.index, true));
+                self.protocols.retain(|(i, _), _| *i != loaded.index);
             }
             self.prefetch();
             terminal.draw(|frame| self.draw(frame))?;
 
-            if event::poll(Duration::from_millis(80))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && !self.handle_key(key)
-            {
-                return Ok(());
+            if event::poll(Duration::from_millis(80))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press && !self.handle_key(key) => {
+                        return Ok(());
+                    }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    _ => {}
+                }
             }
         }
     }
@@ -249,6 +275,31 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    /// Scrolling (wheel or trackpad, either direction) flips; clicking a
+    /// side cover brings it to the centre
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollRight | MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollUp => -1,
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self.hits.iter().find(|(r, _)| {
+                    (r.x..r.x + r.width).contains(&mouse.column) && (r.y..r.y + r.height).contains(&mouse.row)
+                });
+                if let Some(&(_, index)) = hit {
+                    self.selected = index;
+                }
+                return;
+            }
+            _ => return,
+        };
+        // a trackpad sends dozens of scroll events per swipe
+        if self.last_scroll.elapsed() >= SCROLL_STEP {
+            self.last_scroll = Instant::now();
+            self.status = None;
+            self.step(delta);
+        }
     }
 
     fn with_selected(&mut self, verb: &str, action: impl FnOnce(&mut mpd::Mpd, &str) -> Result<()>) {
@@ -343,26 +394,28 @@ impl App {
         }
         let center_x = covers.x + (covers.width - cols) / 2;
         let top = covers.y + (covers.height - rows) / 2;
-        self.draw_cover(frame, self.selected, Rect::new(center_x, top, cols, rows), false);
+        self.hits.clear();
+        self.draw_cover(frame, self.selected, Rect::new(center_x, top, cols, rows), View::Flat);
 
-        // neighbours, shrinking outwards, as many as fit
-        let gap = 1;
-        let mut left_edge = center_x;
-        let mut right_edge = center_x + cols;
-        for (step, scale) in SIDE_SCALES.iter().enumerate() {
-            let side_rows = ((rows as f32) * scale).round().max(1.0) as u16;
-            let side_cols = ((cols as f32) * scale).round().max(1.0) as u16;
-            let y = top + (rows - side_rows) / 2;
-            if let Some(i) = self.selected.checked_sub(step + 1)
-                && left_edge >= covers.x + side_cols + gap
+        // neighbours folded towards the centre, stacked outwards, as many as fit
+        let side_rows = ((rows as f32) * SIDE_HEIGHT).round().max(1.0) as u16;
+        let side_cols = ((side_rows as f32) * aspect * fold::SQUEEZE).round().max(1.0) as u16;
+        let y = top + (rows - side_rows) / 2;
+        let gap = 2;
+        for depth in 1..=MAX_SIDE {
+            let offset = gap + (depth as u16 - 1) * side_cols;
+            if let Some(i) = self.selected.checked_sub(depth)
+                && center_x >= covers.x + offset + side_cols
             {
-                left_edge -= side_cols + gap;
-                self.draw_cover(frame, i, Rect::new(left_edge, y, side_cols, side_rows), true);
+                let x = center_x - offset - side_cols;
+                let view = View::Folded(Facing::Right, depth);
+                self.draw_cover(frame, i, Rect::new(x, y, side_cols, side_rows), view);
             }
-            let i = self.selected + step + 1;
-            if i < albums.len() && right_edge + gap + side_cols <= covers.x + covers.width {
-                self.draw_cover(frame, i, Rect::new(right_edge + gap, y, side_cols, side_rows), true);
-                right_edge += gap + side_cols;
+            let i = self.selected + depth;
+            let x = center_x + cols + offset;
+            if i < albums.len() && x + side_cols <= covers.x + covers.width {
+                let view = View::Folded(Facing::Left, depth);
+                self.draw_cover(frame, i, Rect::new(x, y, side_cols, side_rows), view);
             }
         }
 
@@ -383,11 +436,18 @@ impl App {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text_area);
     }
 
-    fn draw_cover(&mut self, frame: &mut Frame, index: usize, area: Rect, dim: bool) {
+    fn draw_cover(&mut self, frame: &mut Frame, index: usize, area: Rect, view: View) {
+        self.hits.push((area, index));
         if let Some(Some(image)) = self.images.get(&index) {
             let picker = &self.picker;
-            let protocol = self.protocols.entry((index, dim)).or_insert_with(|| {
-                let image = if dim { image.brighten(-70) } else { image.clone() };
+            let protocol = self.protocols.entry((index, view)).or_insert_with(|| {
+                let image = match view {
+                    View::Flat => image.clone(),
+                    // darker the further out
+                    View::Folded(facing, depth) => {
+                        fold::fold(image, facing, (0.85 - 0.08 * (depth - 1) as f32).max(0.35))
+                    }
+                };
                 picker.new_resize_protocol(image)
             });
             frame.render_stateful_widget(StatefulImage::default(), area, protocol);
@@ -398,7 +458,7 @@ impl App {
             Some(None) => self.albums.as_ref().map(|a| a[index].title.clone()).unwrap_or_default(),
             _ => String::new(),
         };
-        let style = if dim { Style::new().dim() } else { Style::new() };
+        let style = if view == View::Flat { Style::new() } else { Style::new().dim() };
         let block = Block::bordered().border_type(BorderType::Rounded).style(style);
         let text = Paragraph::new(title).block(block).alignment(Alignment::Center).wrap(Wrap { trim: true });
         frame.render_widget(text, area);

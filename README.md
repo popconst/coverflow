@@ -20,6 +20,8 @@ album by its cover, press Enter, and the other client shows it playing.
 | Key | |
 |---|---|
 | `h` `l` / `←` `→` (also `k` `j`) | previous / next album |
+| scroll (trackpad swipe or wheel) | flip, one album per ~60 ms |
+| click a side cover | bring it to the centre |
 | `H` `L` / PgUp PgDn | 10 back / forward |
 | `g` `G` | first / last |
 | `/` | search artist, album or year (`Enter` keeps it, `Esc` goes back); `n` `N` next / previous match |
@@ -30,6 +32,10 @@ album by its cover, press Enter, and the other client shows it playing.
 
 ## How it works
 
+- **The fold:** neighbours are turned towards the centre like the original
+  Cover Flow: each is squeezed into a trapezoid, full height at the edge
+  nearest the centre, shorter and darker towards the far edge, and darker the
+  further out it sits.
 - **Albums** are the folders in MPD's library that hold tagged songs, with
   disc folders (`CD1/`, `Disc 2/`, …) folded into their album and `Playlists/`
   folders left out; sorted by album artist, year and title.
