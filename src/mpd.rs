@@ -1,5 +1,5 @@
 //! Just enough of the MPD protocol for coverflow: walking the library,
-//! the current song, and replacing the queue with an album.
+//! an album's songs, the current song, and replacing the queue with an album.
 
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Write};
@@ -73,6 +73,26 @@ impl Mpd {
         Ok(entries)
     }
 
+    /// Every song under `dir` (disc folders included) with its tags, in the
+    /// order `add` queues them: both walk MPD's database the same way.
+    pub fn songs(&mut self, dir: &str) -> Result<Vec<(String, Vec<(String, String)>)>> {
+        let mut songs: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        let mut in_song = false;
+        for (key, value) in self.command(&format!("listallinfo {}", quote(dir)))? {
+            match key.as_str() {
+                "file" => {
+                    songs.push((value, Vec::new()));
+                    in_song = true;
+                }
+                // directories and playlists carry tags of their own
+                "directory" | "playlist" => in_song = false,
+                _ if in_song => songs.last_mut().expect("in a song").1.push((key, value)),
+                _ => {}
+            }
+        }
+        Ok(songs)
+    }
+
     /// The path of the song playing or paused, if any.
     pub fn current_file(&mut self) -> Result<Option<String>> {
         Ok(self.command("currentsong")?.into_iter().find(|(k, _)| k == "file").map(|(_, v)| v))
@@ -82,6 +102,16 @@ impl Mpd {
     pub fn play_dir(&mut self, dir: &str) -> Result<()> {
         self.command(&format!(
             "command_list_begin\nclear\nadd {}\nplay 0\ncommand_list_end",
+            quote(dir)
+        ))?;
+        Ok(())
+    }
+
+    /// Replaces the queue with everything under `dir` and plays from song
+    /// number `index` (0 is the first).
+    pub fn play_dir_from(&mut self, dir: &str, index: usize) -> Result<()> {
+        self.command(&format!(
+            "command_list_begin\nclear\nadd {}\nplay {index}\ncommand_list_end",
             quote(dir)
         ))?;
         Ok(())

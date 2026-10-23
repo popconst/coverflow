@@ -19,13 +19,14 @@ album by its cover, press Enter, and the other client shows it playing.
 
 | Key | |
 |---|---|
-| `h` `l` / `←` `→` (also `k` `j`) | previous / next album |
-| scroll (trackpad swipe or wheel) | flip, one album per ~60 ms |
+| `h` `l` / `←` `→` | previous / next album |
+| scroll (trackpad swipe or wheel) | flip, one album per ~70 ms (holding a key too) |
 | click a side cover | bring it to the centre |
 | `H` `L` / PgUp PgDn | 10 back / forward |
 | `g` `G` | first / last |
 | `/` | search artist, album or year (`Enter` keeps it, `Esc` goes back); `n` `N` next / previous match |
 | `c` | the album that's playing |
+| `k` | the album's tracks: `j` `k` / scroll to choose, `Enter` or click to play the album from that track, `Esc` back |
 | `Enter` | play the album (replaces the queue) |
 | `a` | add the album to the end of the queue |
 | `q` | quit |

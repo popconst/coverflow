@@ -32,14 +32,17 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 const HELP: &str =
-    "h/l ←/→ scroll flip · H/L ±10 · g/G ends · / search · c playing · ⏎ play · a add · q quit";
+    "h/l ←/→ scroll flip · H/L ±10 · g/G ends · / search · c playing · k tracks · ⏎ play · a add · q quit";
+const TRACKS_HELP: &str = "j/k ↓/↑ scroll choose · ⏎ click play from here · a add album · esc back";
 /// How long the row takes to glide to a new album
 const GLIDE: Duration = Duration::from_millis(350);
 /// Further than this, a jump (search, g/G) starts its glide this close to
 /// the target instead of racing past hundreds of covers
 const MAX_GLIDE: f32 = 5.0;
-/// Fastest a scroll wheel or trackpad flips: one album per this long
-const SCROLL_STEP: Duration = Duration::from_millis(60);
+/// Fastest the row flips, by key repeat or scroll wheel or trackpad: one
+/// album per this long. Faster events are dropped, not queued, so the row
+/// stops the moment the key or the swipe does
+const STEP: Duration = Duration::from_millis(70);
 /// Widest the row is rendered while it moves, in pixels; the terminal scales
 /// it up. Only the folded side covers are drawn this small (the centre one
 /// is sharp), and only inside multiplexers like herdr, which slow down with
@@ -64,6 +67,15 @@ struct Options {
 enum Mode {
     Browse,
     Search { query: String, from: usize },
+    /// The selected album's tracks, next to its cover
+    Tracks { tracks: Vec<Track>, cursor: usize, scroll: usize },
+}
+
+struct Track {
+    /// "3" or, on albums of several discs, "2-03"
+    number: String,
+    title: String,
+    seconds: Option<u32>,
 }
 
 /// The row's glide towards the selection: an ease-out from `from` to `to`
@@ -122,8 +134,10 @@ struct App {
     /// Where each cover was drawn, in canvas pixels, and the canvas scale
     hits: Vec<render::Hit>,
     covers_area: Rect,
+    /// Where the track list was drawn, for clicks
+    tracks_area: Rect,
     px_per_cell: f32,
-    last_scroll: Instant,
+    last_step: Instant,
     status: Option<String>,
 }
 
@@ -185,8 +199,9 @@ fn main() -> Result<()> {
         flip: 0,
         hits: Vec::new(),
         covers_area: Rect::default(),
+        tracks_area: Rect::default(),
         px_per_cell: 1.0,
-        last_scroll: Instant::now(),
+        last_step: Instant::now() - STEP,
         status: None,
     };
     crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
@@ -228,6 +243,12 @@ fn parse_args() -> Result<Options> {
         }
     }
     Ok(options)
+}
+
+/// 3:07, or 1:02:44
+fn duration(seconds: u32) -> String {
+    let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
 fn home() -> PathBuf {
@@ -282,9 +303,13 @@ impl App {
             } else {
                 FRAME.saturating_sub(frame_start.elapsed())
             };
-            if event::poll(wait)? {
+            // then everything that's waiting, before the next frame: a
+            // backlog would keep flipping after the key or swipe stopped
+            let mut wait = wait;
+            while event::poll(wait)? {
+                wait = Duration::ZERO;
                 match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press && !self.handle_key(key) => {
+                    Event::Key(key) if key.kind != KeyEventKind::Release && !self.handle_key(key) => {
                         return Ok(());
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -305,8 +330,12 @@ impl App {
         }
     }
 
+    /// Flips by `delta` albums, unless the last flip was too recent
     fn step(&mut self, delta: isize) {
-        self.select((self.selected as isize + delta).max(0) as usize);
+        if self.last_step.elapsed() >= STEP {
+            self.last_step = Instant::now();
+            self.select((self.selected as isize + delta).max(0) as usize);
+        }
     }
 
     fn mpd(&self) -> Result<mpd::Mpd> {
@@ -350,11 +379,39 @@ impl App {
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Mode::Tracks { tracks, cursor, .. } = &mut self.mode {
+            let last = tracks.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Char('c') if ctrl => return false,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.mode = Mode::Browse,
+                KeyCode::Char('j') | KeyCode::Down => *cursor = (*cursor + 1).min(last),
+                KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
+                KeyCode::Char('g') | KeyCode::Home => *cursor = 0,
+                KeyCode::Char('G') | KeyCode::End => *cursor = last,
+                KeyCode::Enter => {
+                    let index = *cursor;
+                    self.play_from(index);
+                }
+                KeyCode::Char('a') => self.with_selected("Added to the queue", |mpd, dir| mpd.add_dir(dir)),
+                // flipping to another album closes the list
+                KeyCode::Char('h') | KeyCode::Left => {
+                    self.mode = Mode::Browse;
+                    self.step(-1);
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    self.mode = Mode::Browse;
+                    self.step(1);
+                }
+                _ => {}
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
             KeyCode::Char('c') if ctrl => return false,
-            KeyCode::Char('l' | 'j') | KeyCode::Right | KeyCode::Down => self.step(1),
-            KeyCode::Char('h' | 'k') | KeyCode::Left | KeyCode::Up => self.step(-1),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Down => self.step(1),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Up => self.step(-1),
+            KeyCode::Char('k') => self.open_tracks(),
             KeyCode::Char('L') | KeyCode::PageDown => self.step(10),
             KeyCode::Char('H') | KeyCode::PageUp => self.step(-10),
             KeyCode::Char('g') | KeyCode::Home => self.select(0),
@@ -373,6 +430,28 @@ impl App {
     /// Scrolling (wheel or trackpad, either direction) flips; clicking a
     /// side cover brings it to the centre
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if let Mode::Tracks { tracks, cursor, scroll } = &mut self.mode {
+            let list = self.tracks_area;
+            let last = tracks.len().saturating_sub(1);
+            match mouse.kind {
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => *cursor = (*cursor + 1).min(last),
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => *cursor = cursor.saturating_sub(1),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let inside = (list.x..list.x + list.width).contains(&mouse.column)
+                        && (list.y..list.y + list.height).contains(&mouse.row);
+                    let index = *scroll + mouse.row.saturating_sub(list.y) as usize;
+                    if inside && index < tracks.len() {
+                        *cursor = index;
+                        self.play_from(index);
+                    } else if !inside {
+                        // a click on the covers goes back to them
+                        self.mode = Mode::Browse;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let delta = match mouse.kind {
             MouseEventKind::ScrollRight | MouseEventKind::ScrollDown => 1,
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollUp => -1,
@@ -390,12 +469,66 @@ impl App {
             }
             _ => return,
         };
-        // a trackpad sends dozens of scroll events per swipe
-        if self.last_scroll.elapsed() >= SCROLL_STEP {
-            self.last_scroll = Instant::now();
-            self.status = None;
-            self.step(delta);
-        }
+        // a trackpad sends dozens of scroll events per swipe; step() drops
+        // the ones that come too fast
+        self.status = None;
+        self.step(delta);
+    }
+
+    /// k: the selected album's tracks, from MPD's database
+    fn open_tracks(&mut self) {
+        let Some(album) = self.albums.as_ref().and_then(|a| a.get(self.selected)).cloned() else {
+            return;
+        };
+        let songs = match self.mpd().and_then(|mut m| m.songs(&album.dir)) {
+            Ok(songs) => songs,
+            Err(e) => {
+                self.status = Some(format!("Error: {e:#}"));
+                return;
+            }
+        };
+        let tag = |tags: &[(String, String)], key: &str| {
+            tags.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.clone())
+        };
+        // "3/12" → 3
+        let number = |value: Option<String>| value.and_then(|v| v.split('/').next()?.trim().parse::<u32>().ok());
+        let discs: HashSet<u32> = songs.iter().filter_map(|(_, t)| number(tag(t, "Disc"))).collect();
+        let tracks = songs
+            .iter()
+            .map(|(file, tags)| {
+                let track = number(tag(tags, "Track"));
+                let disc = number(tag(tags, "Disc"));
+                Track {
+                    number: match (track, disc) {
+                        (Some(t), Some(d)) if discs.len() > 1 => format!("{d}-{t:02}"),
+                        (Some(t), _) => t.to_string(),
+                        _ => String::new(),
+                    },
+                    title: tag(tags, "Title").unwrap_or_else(|| {
+                        // no title tag: the file name, without its extension
+                        let name = file.rsplit('/').next().unwrap_or(file);
+                        name.rsplit_once('.').map_or(name, |(n, _)| n).to_string()
+                    }),
+                    seconds: tag(tags, "duration")
+                        .or_else(|| tag(tags, "Time"))
+                        .and_then(|d| d.parse::<f32>().ok())
+                        .map(|d| d.round() as u32),
+                }
+            })
+            .collect();
+        // start at the song playing, if it's on this album
+        let playing = self.mpd().and_then(|mut m| m.current_file()).ok().flatten();
+        let cursor = playing.and_then(|p| songs.iter().position(|(f, _)| *f == p)).unwrap_or(0);
+        self.mode = Mode::Tracks { tracks, cursor, scroll: 0 };
+    }
+
+    /// Plays the selected album from its `index`th track
+    fn play_from(&mut self, index: usize) {
+        let title = match &self.mode {
+            Mode::Tracks { tracks, .. } => tracks.get(index).map(|t| t.title.clone()).unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.with_selected(&format!("Playing {title}"), |mpd, dir| mpd.play_dir_from(dir, index));
     }
 
     fn with_selected(&mut self, verb: &str, action: impl FnOnce(&mut mpd::Mpd, &str) -> Result<()>) {
@@ -475,7 +608,17 @@ impl App {
 
         // the row of covers, then a blank line and three lines of text
         let text_height = 3.min(area.height);
-        let covers = Rect { height: area.height.saturating_sub(text_height + 1), ..area };
+        let mut covers = Rect { height: area.height.saturating_sub(text_height + 1), ..area };
+        if matches!(self.mode, Mode::Tracks { .. }) {
+            // the row on the left, the list on the right
+            let row_width = covers.width * 9 / 20;
+            let gap = 3.min(covers.width - row_width);
+            let list = Rect { x: covers.x + row_width + gap, width: covers.width - row_width - gap, ..covers };
+            self.draw_tracks(frame, list);
+            covers.width = row_width;
+        } else {
+            self.tracks_area = Rect::default();
+        }
         let pos = self.glide.pos();
         self.draw_row(frame, covers, pos, albums.len());
 
@@ -485,6 +628,10 @@ impl App {
         let bottom = match (&self.mode, &self.status) {
             (Mode::Search { query, .. }, _) => Line::from(format!("/{query}▏")),
             (_, Some(status)) => Line::from(status.clone()),
+            (Mode::Tracks { tracks, .. }, _) => {
+                let total: u32 = tracks.iter().filter_map(|t| t.seconds).sum();
+                Line::from(format!("{} tracks · {}   {TRACKS_HELP}", tracks.len(), duration(total))).dim()
+            }
             _ => Line::from(format!("{} / {}   {HELP}", self.selected + 1, albums.len())).dim(),
         };
         let lines = vec![
@@ -494,6 +641,45 @@ impl App {
         ];
         let text_area = Rect { y: area.y + area.height - text_height, height: text_height, ..area };
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text_area);
+    }
+
+    /// The track list: number, title and length, the chosen one highlighted
+    fn draw_tracks(&mut self, frame: &mut Frame, area: Rect) {
+        let Mode::Tracks { tracks, cursor, scroll } = &mut self.mode else { return };
+        self.tracks_area = area;
+        let rows = area.height as usize;
+        if rows == 0 || area.width < 12 {
+            return;
+        }
+        // keep the chosen track in view, with a line of context
+        if *cursor < *scroll + 1 {
+            *scroll = cursor.saturating_sub(1);
+        } else if *cursor + 2 > *scroll + rows {
+            *scroll = (*cursor + 2).saturating_sub(rows);
+        }
+        *scroll = (*scroll).min(tracks.len().saturating_sub(rows));
+        let shown = &tracks[*scroll..tracks.len().min(*scroll + rows)];
+
+        let number_width = tracks.iter().map(|t| t.number.chars().count()).max().unwrap_or(0) as u16;
+        let numbers = Rect { width: number_width, ..area };
+        let lengths = Rect { x: area.x + area.width - 6, width: 6, ..area };
+        let titles = Rect {
+            x: area.x + number_width + 2,
+            width: area.width.saturating_sub(number_width + 2 + 7),
+            ..area
+        };
+        let column = |f: fn(&Track) -> String| shown.iter().map(|t| Line::from(f(t))).collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(column(|t| t.number.clone())).alignment(Alignment::Right).fg(Color::Blue),
+            numbers,
+        );
+        frame.render_widget(Paragraph::new(column(|t| t.title.clone())), titles);
+        frame.render_widget(
+            Paragraph::new(column(|t| t.seconds.map(duration).unwrap_or_default())).alignment(Alignment::Right),
+            lengths,
+        );
+        let row = Rect { y: area.y + (*cursor - *scroll) as u16, height: 1, ..area };
+        frame.buffer_mut().set_style(row, Style::new().bg(Color::Blue).fg(Color::Black));
     }
 
     /// Renders the row when it moved (or a cover arrived) and places it;
