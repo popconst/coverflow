@@ -32,6 +32,8 @@ struct Scaled {
 pub struct Scene {
     size: (u32, u32),
     scaled: HashMap<usize, Scaled>,
+    /// Stands in for albums without a cover (or not read yet)
+    placeholder: Option<Scaled>,
 }
 
 /// Where a cover was drawn, horizontally in canvas pixels, for clicks
@@ -47,6 +49,7 @@ impl Scene {
         if self.size != (width, height) {
             self.size = (width, height);
             self.scaled.clear();
+            self.placeholder = None;
         }
     }
 
@@ -88,8 +91,10 @@ impl Scene {
                 continue;
             }
             hits.push(Hit { left, right: left + w, index });
-            let Some(Some(cover)) = covers.get(&index) else { continue };
-            let scaled = self.scaled.entry(index).or_insert_with(|| scale(cover, height));
+            let scaled = match covers.get(&index) {
+                Some(Some(cover)) => self.scaled.entry(index).or_insert_with(|| scale(cover, height)),
+                _ => self.placeholder.get_or_insert_with(|| scale(&placeholder(), height)),
+            };
             let source = if h < size * 0.6 { &scaled.half } else { &scaled.full };
             // dimmer as it turns, and further out
             let light = 1.0 - 0.1 * turn - 0.08 * (far - 1.0).clamp(0.0, 4.0);
@@ -101,6 +106,37 @@ impl Scene {
 
 fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
+}
+
+/// A dark sleeve with a record on it
+fn placeholder() -> DynamicImage {
+    const SIZE: u32 = 600;
+    let c = SIZE as f32 / 2.0;
+    DynamicImage::ImageRgba8(RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+        let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+        // sleeve: slate, lighter towards the top left
+        let sheen = 1.0 - (fx + fy) / (2.0 * SIZE as f32);
+        let sleeve = [30.0 + 14.0 * sheen, 34.0 + 16.0 * sheen, 44.0 + 20.0 * sheen];
+        let r = ((fx - c).powi(2) + (fy - c).powi(2)).sqrt() / c;
+        let rgb = if r > 0.82 {
+            sleeve
+        } else if r > 0.32 {
+            // vinyl, with faint grooves and a highlight on one side
+            let groove = if ((r * 90.0) as u32).is_multiple_of(2) { 4.0 } else { 0.0 };
+            let shine = 18.0 * (((fx - c) - (fy - c)) / (c * 1.4)).clamp(0.0, 1.0).powi(2);
+            let v = 14.0 + groove + shine;
+            [v, v, v + 2.0]
+        } else if r > 0.035 {
+            // label
+            [74.0, 104.0, 152.0]
+        } else {
+            sleeve
+        };
+        // soft edge between the record and the sleeve
+        let edge = ((0.82 - r) * c).clamp(0.0, 1.0);
+        let rgb = if r > 0.79 { [0, 1, 2].map(|i| sleeve[i] + (rgb[i] - sleeve[i]) * edge) } else { rgb };
+        Rgba([rgb[0] as u8, rgb[1] as u8, rgb[2] as u8, 255])
+    }))
 }
 
 fn scale(cover: &DynamicImage, size: u32) -> Scaled {
@@ -168,13 +204,37 @@ mod tests {
             return;
         };
         let images: Vec<DynamicImage> = list.split(':').map(|p| image::open(p).unwrap()).collect();
+        // every third album without a cover
         let covers: HashMap<usize, Option<DynamicImage>> =
-            (0..12).map(|i| (i, Some(images[i % images.len()].clone()))).collect();
+            (0..12).map(|i| (i, (i % 3 != 1).then(|| images[i % images.len()].clone()))).collect();
         let mut scene = Scene::default();
         scene.resize(1200, 300);
         for (n, pos) in [5.0, 5.25, 5.5, 5.75, 6.0].iter().enumerate() {
             let (canvas, _) = scene.compose(&covers, *pos, covers.len());
             canvas.save(format!("{dir}/frame{n}.png")).unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    #[test]
+    fn frame_time() {
+        let Ok(list) = std::env::var("COVERFLOW_COVERS") else { return };
+        let img = image::open(list.split(':').next().unwrap()).unwrap();
+        let covers = (0..30).map(|i| (i, Some(img.clone()))).collect();
+        let mut scene = super::Scene::default();
+        scene.resize(1000, 250);
+        scene.compose(&covers, 10.0, 30);
+        let t = std::time::Instant::now();
+        let mut bytes = 0;
+        for k in 0..20 {
+            let (c, _) = scene.compose(&covers, 10.0 + k as f32 * 0.05, 30);
+            let t2 = std::time::Instant::now();
+            let p = crate::kitty::Picture::new(&c, 1, 100, 25, true);
+            bytes = p.len();
+            if k == 0 { eprintln!("encode {:?}", t2.elapsed()); }
+        }
+        eprintln!("per frame {:?}, {} KB sent", t.elapsed() / 20, bytes / 1024);
     }
 }

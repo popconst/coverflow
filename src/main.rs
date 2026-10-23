@@ -3,6 +3,7 @@
 
 mod covers;
 mod library;
+mod kitty;
 mod mpd;
 mod render;
 
@@ -15,7 +16,7 @@ use image::DynamicImage;
 use library::Album;
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Alignment, Rect, Size},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::Paragraph,
@@ -23,7 +24,7 @@ use ratatui::{
 use ratatui_image::{
     Image, Resize,
     picker::{Capability, Picker, ProtocolType},
-    protocol::{Protocol, kitty::Kitty},
+    protocol::Protocol,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -41,7 +42,7 @@ const MAX_GLIDE: f32 = 5.0;
 const SCROLL_STEP: Duration = Duration::from_millis(60);
 /// Widest the row is rendered, in pixels; the terminal scales it up. Keeps
 /// each frame small enough to send ~30 times a second
-const MAX_CANVAS_WIDTH: f32 = 1400.0;
+const MAX_CANVAS_WIDTH: f32 = 900.0;
 /// How far around the selection covers are loaded ahead of time
 const PREFETCH: usize = render::MAX_SIDE + 2;
 /// Covers further than this from the selection are dropped from memory
@@ -78,6 +79,13 @@ impl Glide {
     }
 }
 
+/// The row, encoded for the terminal
+enum Row {
+    Kitty(kitty::Picture),
+    /// Sixel, iTerm2 or half-blocks, through ratatui-image
+    Other(Protocol),
+}
+
 struct App {
     options: Options,
     picker: Picker,
@@ -93,7 +101,7 @@ struct App {
     requested: HashSet<usize>,
     scene: render::Scene,
     /// The row as last rendered, and what it was rendered for
-    frame: Option<(Protocol, f32, Rect)>,
+    frame: Option<(Row, f32, Rect)>,
     /// Something besides the position changed (a cover arrived): re-render
     stale: bool,
     /// Two image ids, used in turn, so a frame is never shown half-sent
@@ -471,29 +479,30 @@ impl App {
             self.hits = hits;
             self.covers_area = area;
             self.px_per_cell = font.width as f32 * scale;
-            if let Some(protocol) = self.protocol(DynamicImage::ImageRgba8(canvas), area) {
-                self.frame = Some((protocol, pos, area));
+            if let Some(row) = self.encode(canvas, area) {
+                self.frame = Some((row, pos, area));
             }
             self.stale = false;
         }
-        if let Some((protocol, ..)) = &self.frame {
-            frame.render_widget(Image::new(protocol), area);
+        match &self.frame {
+            Some((Row::Kitty(picture), ..)) => frame.render_widget(picture, area),
+            Some((Row::Other(protocol), ..)) => frame.render_widget(Image::new(protocol), area),
+            None => {}
         }
     }
 
     /// The row image for the terminal. With kitty graphics it goes to one of
     /// two fixed image ids in turn: re-sending an id replaces its picture
     /// instead of piling up new ones in the terminal.
-    fn protocol(&mut self, image: DynamicImage, area: Rect) -> Option<Protocol> {
+    fn encode(&mut self, canvas: image::RgbaImage, area: Rect) -> Option<Row> {
         if self.picker.protocol_type() == ProtocolType::Kitty {
             self.flip ^= 1;
             let compress = self.picker.capabilities().contains(&Capability::KittyCompression);
-            let size = Size::new(area.width, area.height);
-            Kitty::new(image, size, self.kitty_ids[self.flip], self.picker.tmux_detected(), compress)
-                .ok()
-                .map(Protocol::Kitty)
+            let id = self.kitty_ids[self.flip];
+            Some(Row::Kitty(kitty::Picture::new(&canvas, id, area.width, area.height, compress)))
         } else {
-            self.picker.new_protocol(image, area.into(), Resize::Fit(None)).ok()
+            let image = DynamicImage::ImageRgba8(canvas);
+            self.picker.new_protocol(image, area.into(), Resize::Fit(None)).ok().map(Row::Other)
         }
     }
 }

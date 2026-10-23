@@ -336,7 +336,9 @@ name = "coverflow"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64-simd",
  "crossterm",
+ "flate2",
  "image",
  "ratatui",
  "ratatui-image",
