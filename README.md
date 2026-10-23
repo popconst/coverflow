@@ -38,11 +38,14 @@ album by its cover, press Enter, and the other client shows it playing.
   further out it sits.
 - **Albums** are the folders in MPD's library that hold tagged songs, with
   disc folders (`CD1/`, `Disc 2/`, …) folded into their album and `Playlists/`
-  folders left out; sorted by album artist, year and title.
+  folders left out; sorted by title.
 - **Covers** are each album folder's `cover.jpg` (or `folder.jpg`,
-  `front.jpg`). They're read in the background, one at a time, and kept as
+  `front.jpg`); albums without one (or on a drive that isn't plugged in)
+  get a plain record sleeve. They're read in the background, one at a time, and kept as
   small thumbnails in `~/Library/Caches/coverflow`, so a slow music drive is
   read once per cover and browsing works when it's unplugged.
+- **The row** is drawn as one picture, in pixels, so it glides smoothly
+  between albums rather than jumping a terminal cell at a time.
 - **Images** are drawn with whatever the terminal supports (kitty graphics,
   Sixel, iTerm2, or coloured half-blocks), via
   [ratatui-image](https://github.com/ratatui/ratatui-image). Works inside

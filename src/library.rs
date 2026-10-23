@@ -1,6 +1,5 @@
 //! The album list: every folder in MPD's library that holds songs, with disc
-//! folders (CD1/, Disc 2/, …) folded into their album, sorted by artist,
-//! year and title.
+//! folders (CD1/, Disc 2/, …) folded into their album, sorted by title.
 
 use crate::mpd::{Entry, Mpd};
 use anyhow::Result;
@@ -16,10 +15,11 @@ pub struct Album {
 }
 
 impl Album {
+    /// By title (case-insensitive, leading quotes and brackets ignored), then
+    /// artist and year for albums that share one
     fn sort_key(&self) -> (String, String, String) {
-        let artist = self.artist.to_lowercase();
-        let artist = artist.strip_prefix("the ").unwrap_or(&artist).to_string();
-        (artist, self.year.clone(), self.title.to_lowercase())
+        let title = self.title.trim_start_matches(|c: char| !c.is_alphanumeric());
+        (title.to_lowercase(), self.artist.to_lowercase(), self.year.clone())
     }
 
     /// Whether a search matches this album (case-insensitive, any word order)

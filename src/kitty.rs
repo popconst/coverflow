@@ -1,0 +1,481 @@
+//! Sends the row to the terminal with the kitty graphics protocol, as an
+//! image stretched over a block of cells (unicode placeholders, so it works
+//! through multiplexers like herdr). ratatui-image's sender leaves out the
+//! block's size, so the terminal shows the image at its pixel size instead.
+//!
+//! Where the terminal can read files (kitty, Ghostty), a frame goes as a
+//! temporary file: only its path passes through the terminal (and herdr),
+//! so full-resolution frames can be sent ~30 times a second.
+
+use flate2::{Compression, write::ZlibEncoder};
+use image::RgbaImage;
+use ratatui::{
+    buffer::{Buffer, CellDiffOption},
+    layout::Rect,
+    style::Color,
+    widgets::Widget,
+};
+use std::io::{Read, Write};
+use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// How frames get to the terminal
+#[derive(Clone)]
+pub enum Medium {
+    /// In the escape codes themselves, deflated when the terminal takes that
+    Direct { compress: bool },
+    /// As temporary files in this folder, which the terminal reads and deletes
+    TempFile(PathBuf),
+}
+
+/// Asks the terminal whether it reads images from temporary files in the
+/// system's temp folder, or /tmp. Needs raw mode; run once at start-up.
+pub fn probe_temp_file() -> Option<PathBuf> {
+    let dirs = [std::env::temp_dir(), PathBuf::from("/tmp")];
+    let mut query = String::new();
+    let mut probes = Vec::new();
+    for (n, dir) in dirs.iter().enumerate() {
+        // a 1×1 RGB image
+        let path = temp_path(dir);
+        std::fs::write(&path, [0u8; 3]).ok()?;
+        probes.push(path.clone());
+        let payload = base64_simd::STANDARD.encode_to_string(path.to_string_lossy().as_bytes());
+        query.push_str(&format!("\x1b_Gi={},s=1,v=1,a=q,t=t,f=24;{payload}\x1b\\", 0x7f_fff0 + n));
+    }
+    // device attributes: every terminal answers, so we know when to stop
+    query.push_str("\x1b[c");
+    let mut out = std::io::stdout();
+    out.write_all(query.as_bytes()).ok()?;
+    out.flush().ok()?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+        while std::io::stdin().read(&mut byte).is_ok_and(|n| n == 1) {
+            reply.push(byte[0]);
+            // the device attributes answer ends the reply: ESC [ ? … c
+            if byte[0] == b'c' && reply.windows(3).any(|w| w == b"\x1b[?") {
+                break;
+            }
+        }
+        let _ = tx.send(reply);
+    });
+    let reply = rx.recv_timeout(Duration::from_secs(2));
+    // the terminal deletes the ones it read
+    for path in probes {
+        let _ = std::fs::remove_file(path);
+    }
+    let reply = String::from_utf8_lossy(&reply.ok()?).into_owned();
+    dirs.into_iter()
+        .enumerate()
+        .find(|(n, _)| reply.contains(&format!("i={};OK", 0x7f_fff0 + n)))
+        .map(|(_, dir)| dir)
+}
+
+/// The terminal only reads temporary files with this in their name
+fn temp_path(dir: &Path) -> PathBuf {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("coverflow-tty-graphics-protocol-{}-{n}.rgba", std::process::id()))
+}
+
+/// An image ready to place: sent with the first cell drawn, then only the
+/// placeholder cells
+pub struct Picture {
+    id: u32,
+    cols: u16,
+    rows: u16,
+    transmit: std::cell::Cell<Option<String>>,
+}
+
+impl Picture {
+    /// Encodes `image` under image `id` (replacing what the id showed),
+    /// stretched over `cols` × `rows` cells
+    pub fn new(image: &RgbaImage, id: u32, cols: u16, rows: u16, medium: &Medium) -> Self {
+        let (w, h) = image.dimensions();
+        let compress = match medium {
+            Medium::TempFile(dir) => {
+                let path = temp_path(dir);
+                if std::fs::write(&path, image.as_raw()).is_ok() {
+                    let payload = base64_simd::STANDARD.encode_to_string(path.to_string_lossy().as_bytes());
+                    let transmit = format!(
+                        "\x1b_Gq=2,i={id},a=T,U=1,f=32,t=t,s={w},v={h},c={cols},r={rows};{payload}\x1b\\"
+                    );
+                    return Picture { id, cols, rows, transmit: std::cell::Cell::new(Some(transmit)) };
+                }
+                true
+            }
+            Medium::Direct { compress } => *compress,
+        };
+        let bytes = if compress {
+            // fast over small: a frame is sent ~30 times a second
+            let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
+            zlib.write_all(image.as_raw()).expect("writing into a Vec");
+            zlib.finish().expect("writing into a Vec")
+        } else {
+            image.as_raw().clone()
+        };
+        let compression = if compress { "o=z," } else { "" };
+
+        let mut transmit = String::with_capacity(bytes.len() * 4 / 3 + bytes.len() / 3000 * 16 + 100);
+        let chunks: Vec<&[u8]> = bytes.chunks(3072).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            transmit.push_str("\x1b_Gq=2,");
+            if i == 0 {
+                transmit.push_str(&format!("i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},c={cols},r={rows},"));
+            }
+            transmit.push_str(if i + 1 < chunks.len() { "m=1;" } else { "m=0;" });
+            base64_simd::STANDARD.encode_append(chunk, &mut transmit);
+            transmit.push_str("\x1b\\");
+        }
+        Picture { id, cols, rows, transmit: std::cell::Cell::new(Some(transmit)) }
+    }
+}
+
+#[cfg(test)]
+impl Picture {
+    pub fn len(&self) -> usize {
+        let t = self.transmit.take();
+        let n = t.as_ref().map_or(0, String::len);
+        self.transmit.set(t);
+        n
+    }
+}
+
+impl Widget for &Picture {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        // the id goes in the cells' colour (low 24 bits) and a third
+        // diacritic (high byte)
+        let [high, r, g, b] = self.id.to_be_bytes();
+        let fg = Color::Rgb(r, g, b);
+        let mut transmit = self.transmit.take();
+        let width = area.width.min(self.cols).min(DIACRITICS.len() as u16);
+        let height = area.height.min(self.rows).min(DIACRITICS.len() as u16);
+        let mut symbol = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) else { continue };
+                symbol.clear();
+                if let Some(seq) = transmit.take() {
+                    symbol.push_str(&seq);
+                }
+                symbol.push(PLACEHOLDER);
+                if x == 0 {
+                    symbol.push(DIACRITICS[y as usize]);
+                    symbol.push(DIACRITICS[0]);
+                    symbol.push(DIACRITICS[high as usize]);
+                }
+                cell.set_symbol(&symbol)
+                    .set_fg(fg)
+                    .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap()));
+            }
+        }
+    }
+}
+
+/// Row/column numbers for the placeholders, from kitty's
+/// rowcolumn-diacritics.txt (table as in ratatui-image, MIT)
+static DIACRITICS: [char; 297] = [
+    '\u{305}',
+    '\u{30D}',
+    '\u{30E}',
+    '\u{310}',
+    '\u{312}',
+    '\u{33D}',
+    '\u{33E}',
+    '\u{33F}',
+    '\u{346}',
+    '\u{34A}',
+    '\u{34B}',
+    '\u{34C}',
+    '\u{350}',
+    '\u{351}',
+    '\u{352}',
+    '\u{357}',
+    '\u{35B}',
+    '\u{363}',
+    '\u{364}',
+    '\u{365}',
+    '\u{366}',
+    '\u{367}',
+    '\u{368}',
+    '\u{369}',
+    '\u{36A}',
+    '\u{36B}',
+    '\u{36C}',
+    '\u{36D}',
+    '\u{36E}',
+    '\u{36F}',
+    '\u{483}',
+    '\u{484}',
+    '\u{485}',
+    '\u{486}',
+    '\u{487}',
+    '\u{592}',
+    '\u{593}',
+    '\u{594}',
+    '\u{595}',
+    '\u{597}',
+    '\u{598}',
+    '\u{599}',
+    '\u{59C}',
+    '\u{59D}',
+    '\u{59E}',
+    '\u{59F}',
+    '\u{5A0}',
+    '\u{5A1}',
+    '\u{5A8}',
+    '\u{5A9}',
+    '\u{5AB}',
+    '\u{5AC}',
+    '\u{5AF}',
+    '\u{5C4}',
+    '\u{610}',
+    '\u{611}',
+    '\u{612}',
+    '\u{613}',
+    '\u{614}',
+    '\u{615}',
+    '\u{616}',
+    '\u{617}',
+    '\u{657}',
+    '\u{658}',
+    '\u{659}',
+    '\u{65A}',
+    '\u{65B}',
+    '\u{65D}',
+    '\u{65E}',
+    '\u{6D6}',
+    '\u{6D7}',
+    '\u{6D8}',
+    '\u{6D9}',
+    '\u{6DA}',
+    '\u{6DB}',
+    '\u{6DC}',
+    '\u{6DF}',
+    '\u{6E0}',
+    '\u{6E1}',
+    '\u{6E2}',
+    '\u{6E4}',
+    '\u{6E7}',
+    '\u{6E8}',
+    '\u{6EB}',
+    '\u{6EC}',
+    '\u{730}',
+    '\u{732}',
+    '\u{733}',
+    '\u{735}',
+    '\u{736}',
+    '\u{73A}',
+    '\u{73D}',
+    '\u{73F}',
+    '\u{740}',
+    '\u{741}',
+    '\u{743}',
+    '\u{745}',
+    '\u{747}',
+    '\u{749}',
+    '\u{74A}',
+    '\u{7EB}',
+    '\u{7EC}',
+    '\u{7ED}',
+    '\u{7EE}',
+    '\u{7EF}',
+    '\u{7F0}',
+    '\u{7F1}',
+    '\u{7F3}',
+    '\u{816}',
+    '\u{817}',
+    '\u{818}',
+    '\u{819}',
+    '\u{81B}',
+    '\u{81C}',
+    '\u{81D}',
+    '\u{81E}',
+    '\u{81F}',
+    '\u{820}',
+    '\u{821}',
+    '\u{822}',
+    '\u{823}',
+    '\u{825}',
+    '\u{826}',
+    '\u{827}',
+    '\u{829}',
+    '\u{82A}',
+    '\u{82B}',
+    '\u{82C}',
+    '\u{82D}',
+    '\u{951}',
+    '\u{953}',
+    '\u{954}',
+    '\u{F82}',
+    '\u{F83}',
+    '\u{F86}',
+    '\u{F87}',
+    '\u{135D}',
+    '\u{135E}',
+    '\u{135F}',
+    '\u{17DD}',
+    '\u{193A}',
+    '\u{1A17}',
+    '\u{1A75}',
+    '\u{1A76}',
+    '\u{1A77}',
+    '\u{1A78}',
+    '\u{1A79}',
+    '\u{1A7A}',
+    '\u{1A7B}',
+    '\u{1A7C}',
+    '\u{1B6B}',
+    '\u{1B6D}',
+    '\u{1B6E}',
+    '\u{1B6F}',
+    '\u{1B70}',
+    '\u{1B71}',
+    '\u{1B72}',
+    '\u{1B73}',
+    '\u{1CD0}',
+    '\u{1CD1}',
+    '\u{1CD2}',
+    '\u{1CDA}',
+    '\u{1CDB}',
+    '\u{1CE0}',
+    '\u{1DC0}',
+    '\u{1DC1}',
+    '\u{1DC3}',
+    '\u{1DC4}',
+    '\u{1DC5}',
+    '\u{1DC6}',
+    '\u{1DC7}',
+    '\u{1DC8}',
+    '\u{1DC9}',
+    '\u{1DCB}',
+    '\u{1DCC}',
+    '\u{1DD1}',
+    '\u{1DD2}',
+    '\u{1DD3}',
+    '\u{1DD4}',
+    '\u{1DD5}',
+    '\u{1DD6}',
+    '\u{1DD7}',
+    '\u{1DD8}',
+    '\u{1DD9}',
+    '\u{1DDA}',
+    '\u{1DDB}',
+    '\u{1DDC}',
+    '\u{1DDD}',
+    '\u{1DDE}',
+    '\u{1DDF}',
+    '\u{1DE0}',
+    '\u{1DE1}',
+    '\u{1DE2}',
+    '\u{1DE3}',
+    '\u{1DE4}',
+    '\u{1DE5}',
+    '\u{1DE6}',
+    '\u{1DFE}',
+    '\u{20D0}',
+    '\u{20D1}',
+    '\u{20D4}',
+    '\u{20D5}',
+    '\u{20D6}',
+    '\u{20D7}',
+    '\u{20DB}',
+    '\u{20DC}',
+    '\u{20E1}',
+    '\u{20E7}',
+    '\u{20E9}',
+    '\u{20F0}',
+    '\u{2CEF}',
+    '\u{2CF0}',
+    '\u{2CF1}',
+    '\u{2DE0}',
+    '\u{2DE1}',
+    '\u{2DE2}',
+    '\u{2DE3}',
+    '\u{2DE4}',
+    '\u{2DE5}',
+    '\u{2DE6}',
+    '\u{2DE7}',
+    '\u{2DE8}',
+    '\u{2DE9}',
+    '\u{2DEA}',
+    '\u{2DEB}',
+    '\u{2DEC}',
+    '\u{2DED}',
+    '\u{2DEE}',
+    '\u{2DEF}',
+    '\u{2DF0}',
+    '\u{2DF1}',
+    '\u{2DF2}',
+    '\u{2DF3}',
+    '\u{2DF4}',
+    '\u{2DF5}',
+    '\u{2DF6}',
+    '\u{2DF7}',
+    '\u{2DF8}',
+    '\u{2DF9}',
+    '\u{2DFA}',
+    '\u{2DFB}',
+    '\u{2DFC}',
+    '\u{2DFD}',
+    '\u{2DFE}',
+    '\u{2DFF}',
+    '\u{A66F}',
+    '\u{A67C}',
+    '\u{A67D}',
+    '\u{A6F0}',
+    '\u{A6F1}',
+    '\u{A8E0}',
+    '\u{A8E1}',
+    '\u{A8E2}',
+    '\u{A8E3}',
+    '\u{A8E4}',
+    '\u{A8E5}',
+    '\u{A8E6}',
+    '\u{A8E7}',
+    '\u{A8E8}',
+    '\u{A8E9}',
+    '\u{A8EA}',
+    '\u{A8EB}',
+    '\u{A8EC}',
+    '\u{A8ED}',
+    '\u{A8EE}',
+    '\u{A8EF}',
+    '\u{A8F0}',
+    '\u{A8F1}',
+    '\u{AAB0}',
+    '\u{AAB2}',
+    '\u{AAB3}',
+    '\u{AAB7}',
+    '\u{AAB8}',
+    '\u{AABE}',
+    '\u{AABF}',
+    '\u{AAC1}',
+    '\u{FE20}',
+    '\u{FE21}',
+    '\u{FE22}',
+    '\u{FE23}',
+    '\u{FE24}',
+    '\u{FE25}',
+    '\u{FE26}',
+    '\u{10A0F}',
+    '\u{10A38}',
+    '\u{1D185}',
+    '\u{1D186}',
+    '\u{1D187}',
+    '\u{1D188}',
+    '\u{1D189}',
+    '\u{1D1AA}',
+    '\u{1D1AB}',
+    '\u{1D1AC}',
+    '\u{1D1AD}',
+    '\u{1D242}',
+    '\u{1D243}',
+    '\u{1D244}',
+];
