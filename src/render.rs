@@ -158,7 +158,9 @@ struct Placement {
 }
 
 /// Draws `source` turned by `p.turn`: column by column, each column shorter
-/// and darker towards the far edge, the source column sampled to fit.
+/// and darker towards the far edge. Each canvas pixel averages the source
+/// pixels it covers across, and blends the two nearest down, so a cover that
+/// shrinks while gliding stays smooth instead of breaking into blocks.
 fn draw(canvas: &mut RgbaImage, source: &RgbaImage, p: Placement) {
     let (cw, ch) = (canvas.width() as i64, canvas.height() as i64);
     let (sw, sh) = (source.width() as f32, source.height() as f32);
@@ -166,6 +168,7 @@ fn draw(canvas: &mut RgbaImage, source: &RgbaImage, p: Placement) {
     let far_shade = 1.0 - (1.0 - FAR_SHADE) * p.turn;
     let x0 = p.left.floor() as i64;
     let x1 = (p.left + p.w).ceil() as i64;
+    let mut column: Vec<[f32; 3]> = Vec::with_capacity(source.height() as usize);
     for x in x0.max(0)..x1.min(cw) {
         let t = ((x as f32 + 0.5 - p.left) / p.w).clamp(0.0, 1.0);
         let near = if p.left_side { t } else { 1.0 - t };
@@ -174,19 +177,52 @@ fn draw(canvas: &mut RgbaImage, source: &RgbaImage, p: Placement) {
         let shade = p.light * (far_shade + (1.0 - far_shade) * near);
         // edge columns only partly covered: blend, for smooth motion
         let coverage = ((x as f32 + 1.0).min(p.left + p.w) - (x as f32).max(p.left)).clamp(0.0, 1.0);
-        let sx = ((t * sw) as u32).min(source.width() - 1);
+
+        // the source columns this canvas column spans, averaged
+        let s0 = ((x as f32 - p.left) / p.w * sw).clamp(0.0, sw - 1.0);
+        let s1 = ((x as f32 + 1.0 - p.left) / p.w * sw).clamp(s0 + 1.0, sw);
+        let (c0, c1) = (s0 as u32, (s1.ceil() as u32).min(source.width()));
+        column.clear();
+        for sy in 0..source.height() {
+            let mut sum = [0.0f32; 3];
+            for sx in c0..c1 {
+                let Rgba([r, g, b, _]) = *source.get_pixel(sx, sy);
+                sum[0] += r as f32;
+                sum[1] += g as f32;
+                sum[2] += b as f32;
+            }
+            let n = (c1 - c0).max(1) as f32;
+            column.push(sum.map(|v| v / n));
+        }
+
         let y0 = top.floor() as i64;
         let y1 = (top + col_h).ceil() as i64;
         for y in y0.max(0)..y1.min(ch) {
-            let v = ((y as f32 + 0.5 - top) / col_h).clamp(0.0, 1.0);
-            let sy = ((v * sh) as u32).min(source.height() - 1);
             let vcov = ((y as f32 + 1.0).min(top + col_h) - (y as f32).max(top)).clamp(0.0, 1.0);
             let alpha = coverage * vcov;
-            let Rgba([r, g, b, _]) = *source.get_pixel(sx, sy);
+            // the source rows this pixel spans: averaged when shrinking,
+            // the two nearest blended otherwise
+            let r0 = (((y as f32 - top) / col_h) * sh).clamp(0.0, sh - 1.0);
+            let r1 = (((y as f32 + 1.0 - top) / col_h) * sh).clamp(r0, sh);
+            let rgb = if r1 - r0 > 1.0 {
+                let (a, b) = (r0 as usize, (r1.ceil() as usize).min(column.len()));
+                let mut sum = [0.0f32; 3];
+                for c in &column[a..b] {
+                    for i in 0..3 {
+                        sum[i] += c[i];
+                    }
+                }
+                sum.map(|v| v / (b - a) as f32)
+            } else {
+                let m = ((r0 + r1) / 2.0 - 0.5).clamp(0.0, sh - 1.0);
+                let (a, f) = (m as usize, m.fract());
+                let b = (a + 1).min(column.len() - 1);
+                [0, 1, 2].map(|i| column[a][i] * (1.0 - f) + column[b][i] * f)
+            };
             let under = *canvas.get_pixel(x as u32, y as u32);
-            let mix = |c: u8, u: u8| (c as f32 * shade * alpha + u as f32 * (1.0 - alpha)).round() as u8;
+            let mix = |c: f32, u: u8| (c * shade * alpha + u as f32 * (1.0 - alpha)).round() as u8;
             let a = (255.0 * alpha + under[3] as f32 * (1.0 - alpha)).round() as u8;
-            canvas.put_pixel(x as u32, y as u32, Rgba([mix(r, under[0]), mix(g, under[1]), mix(b, under[2]), a]));
+            canvas.put_pixel(x as u32, y as u32, Rgba([mix(rgb[0], under[0]), mix(rgb[1], under[1]), mix(rgb[2], under[2]), a]));
         }
     }
 }
@@ -208,7 +244,7 @@ mod tests {
         let covers: HashMap<usize, Option<DynamicImage>> =
             (0..12).map(|i| (i, (i % 3 != 1).then(|| images[i % images.len()].clone()))).collect();
         let mut scene = Scene::default();
-        scene.resize(1200, 300);
+        scene.resize(1000, 250);
         for (n, pos) in [5.0, 5.25, 5.5, 5.75, 6.0].iter().enumerate() {
             let (canvas, _) = scene.compose(&covers, *pos, covers.len());
             canvas.save(format!("{dir}/frame{n}.png")).unwrap();

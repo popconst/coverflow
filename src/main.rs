@@ -41,9 +41,9 @@ const MAX_GLIDE: f32 = 5.0;
 /// Fastest a scroll wheel or trackpad flips: one album per this long
 const SCROLL_STEP: Duration = Duration::from_millis(60);
 /// Widest the row is rendered while it moves, in pixels; the terminal scales
-/// it up (blockily, so not by much). Once it stops it's rendered once more at
-/// the pane's full resolution
-const MOTION_WIDTH: f32 = 1600.0;
+/// it up. More than this is more than herdr passes on ~30 times a second.
+/// Once it stops it's rendered once more at the pane's full resolution
+const MOTION_WIDTH: f32 = 1000.0;
 /// Time per frame while the row moves, at most
 const FRAME: Duration = Duration::from_millis(33);
 /// Widest a still frame is rendered
