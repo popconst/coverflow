@@ -21,14 +21,12 @@ pub enum Facing {
     Left,
 }
 
-/// Folds `image` towards the centre by `amount` (0 flat … 1 fully turned);
-/// `light` (0–1) darkens the whole cover, for covers further out.
-pub fn fold(image: &DynamicImage, facing: Facing, amount: f32, light: f32) -> DynamicImage {
+/// Folds `image` towards the centre; `light` (0–1) darkens the whole cover,
+/// for covers further out.
+pub fn fold(image: &DynamicImage, facing: Facing, light: f32) -> DynamicImage {
     let src = image.to_rgba8();
     let (w, h) = src.dimensions();
-    let lerp = |full: f32| 1.0 - (1.0 - full) * amount;
-    let (squeeze, far_edge, far_shade) = (lerp(SQUEEZE), lerp(FAR_EDGE), lerp(FAR_SHADE));
-    let out_w = ((w as f32 * squeeze).round() as u32).max(2);
+    let out_w = ((w as f32 * SQUEEZE).round() as u32).max(2);
     let mut out = RgbaImage::from_pixel(out_w, h, Rgba([0, 0, 0, 0]));
 
     for x in 0..out_w {
@@ -38,9 +36,9 @@ pub fn fold(image: &DynamicImage, facing: Facing, amount: f32, light: f32) -> Dy
             Facing::Right => t,
             Facing::Left => 1.0 - t,
         };
-        let col_h = h as f32 * (far_edge + (1.0 - far_edge) * near);
+        let col_h = h as f32 * (FAR_EDGE + (1.0 - FAR_EDGE) * near);
         let top = (h as f32 - col_h) / 2.0;
-        let shade = light * (far_shade + (1.0 - far_shade) * near);
+        let shade = light * (FAR_SHADE + (1.0 - FAR_SHADE) * near);
         let sx = ((t * (w - 1) as f32).round() as u32).min(w - 1);
         let (y0, y1) = (top.ceil() as u32, (top + col_h).floor() as u32);
         for y in y0..y1.min(h) {
@@ -81,7 +79,7 @@ mod tests {
                 (Facing::Left, center_x + size + 10 + (depth as u32 - 1) * side_w),
             ] {
                 let img = covers[depth % covers.len()].resize_exact(side_h, side_h, imageops::FilterType::Triangle);
-                let folded = fold(&img, facing, 1.0, light).to_rgba8();
+                let folded = fold(&img, facing, light).to_rgba8();
                 imageops::overlay(&mut canvas, &folded, x as i64, y as i64);
             }
         }
