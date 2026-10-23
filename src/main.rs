@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet};
@@ -459,8 +459,9 @@ impl App {
             _ => String::new(),
         };
         let style = if view == View::Flat { Style::new() } else { Style::new().dim() };
-        let block = Block::bordered().border_type(BorderType::Rounded).style(style);
-        let text = Paragraph::new(title).block(block).alignment(Alignment::Center).wrap(Wrap { trim: true });
-        frame.render_widget(text, area);
+        // vertically centred, no frame
+        let middle = Rect { y: area.y + area.height / 2, height: 1.min(area.height), ..area };
+        let text = Paragraph::new(title).style(style).alignment(Alignment::Center).wrap(Wrap { trim: true });
+        frame.render_widget(text, middle);
     }
 }
