@@ -38,7 +38,7 @@ album by its cover, press Enter, and the other client shows it playing.
   further out it sits.
 - **Albums** are the folders in MPD's library that hold tagged songs, with
   disc folders (`CD1/`, `Disc 2/`, …) folded into their album and `Playlists/`
-  folders left out; sorted by album artist, year and title.
+  folders left out; sorted by title.
 - **Covers** are each album folder's `cover.jpg` (or `folder.jpg`,
   `front.jpg`); albums without one (or on a drive that isn't plugged in)
   get a plain record sleeve. They're read in the background, one at a time, and kept as
