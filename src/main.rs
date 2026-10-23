@@ -41,9 +41,10 @@ const MAX_GLIDE: f32 = 5.0;
 /// Fastest a scroll wheel or trackpad flips: one album per this long
 const SCROLL_STEP: Duration = Duration::from_millis(60);
 /// Widest the row is rendered while it moves, in pixels; the terminal scales
-/// it up. More than this is more than herdr passes on ~30 times a second.
-/// Once it stops it's rendered once more at the pane's full resolution
-const MOTION_WIDTH: f32 = 1000.0;
+/// it up. Only the folded side covers are drawn this small (the centre one
+/// is sharp), and only inside multiplexers like herdr, which slow down with
+/// every pixel. Once the row stops it's rendered at full resolution
+const MOTION_WIDTH: f32 = 800.0;
 /// Time per frame while the row moves, at most
 const FRAME: Duration = Duration::from_millis(33);
 /// Widest a still frame is rendered
@@ -86,7 +87,8 @@ impl Glide {
 
 /// The row, encoded for the terminal
 enum Row {
-    Kitty(kitty::Picture),
+    /// One or more pictures side by side, each over its cells
+    Kitty(Vec<(kitty::Picture, Rect)>),
     /// Sixel, iTerm2 or half-blocks, through ratatui-image
     Other(Protocol),
 }
@@ -113,7 +115,8 @@ struct App {
     frame: Option<(Row, f32, Rect, bool)>,
     /// Something besides the position changed (a cover arrived): re-render
     stale: bool,
-    /// Two image ids, used in turn, so a frame is never shown half-sent
+    /// Two sets of three image ids (a frame is up to three pictures), used
+    /// in turn, so a frame is never shown half-sent
     kitty_ids: [u32; 2],
     flip: usize,
     /// Where each cover was drawn, in canvas pixels, and the canvas scale
@@ -147,9 +150,17 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // ask the terminal how it draws images (kitty, sixel…) and its cell size
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    let medium = match kitty::probe_temp_file() {
-        Some(dir) if picker.protocol_type() == ProtocolType::Kitty => kitty::Medium::TempFile(dir),
-        _ => kitty::Medium::Direct { compress: picker.capabilities().contains(&Capability::KittyCompression) },
+    // herdr takes images as files too, but then handles every pixel itself
+    // and slows to a crawl; inside it, frames go in the escape codes
+    let in_herdr = std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "herdr");
+    let temp_dir = if picker.protocol_type() == ProtocolType::Kitty && !in_herdr {
+        kitty::probe_temp_file()
+    } else {
+        None
+    };
+    let medium = match temp_dir {
+        Some(dir) => kitty::Medium::TempFile(dir),
+        None => kitty::Medium::Direct { compress: picker.capabilities().contains(&Capability::KittyCompression) },
     };
     // kitty image ids are 24 bits plus a high byte; keep them small and ours
     let base = (std::process::id() % 0x7f_ff00) + 0x100;
@@ -170,7 +181,7 @@ fn main() -> Result<()> {
         still: render::Scene::default(),
         frame: None,
         stale: true,
-        kitty_ids: [base, base + 1],
+        kitty_ids: [base, base + 3],
         flip: 0,
         hits: Vec::new(),
         covers_area: Rect::default(),
@@ -485,8 +496,8 @@ impl App {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text_area);
     }
 
-    /// Renders the row as one image when it moved (or a cover arrived), and
-    /// places it; otherwise places the last one again, which costs nothing.
+    /// Renders the row when it moved (or a cover arrived) and places it;
+    /// otherwise places the last one again, which costs nothing.
     fn draw_row(&mut self, frame: &mut Frame, area: Rect, pos: f32, count: usize) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -495,39 +506,86 @@ impl App {
         let fresh = matches!(&self.frame, Some((_, p, a, s)) if *p == pos && *a == area && *s == still);
         if !fresh || self.stale {
             let font = self.picker.font_size();
-            let full_width = area.width as f32 * font.width as f32;
+            let (fw, fh) = (font.width as f32, font.height as f32);
+            let full = (area.width as f32 * fw, area.height as f32 * fh);
+            let sharp = (STILL_WIDTH / full.0).min(1.0);
+            let kitty = self.picker.protocol_type() == ProtocolType::Kitty;
             // frames sent as files cost the terminal nothing to pass on
-            let full_motion = matches!(self.medium, kitty::Medium::TempFile(_));
-            let max_width = if still || full_motion { STILL_WIDTH } else { MOTION_WIDTH };
-            let scale = (max_width / full_width).min(1.0);
-            let width = (full_width * scale).round() as u32;
-            let height = (area.height as f32 * font.height as f32 * scale).round() as u32;
-            let scene = if still { &mut self.still } else { &mut self.motion };
-            scene.resize(width, height);
-            let (canvas, hits) = scene.compose(&self.images, pos, count);
+            let cheap = matches!(self.medium, kitty::Medium::TempFile(_));
+            let size = |scale: f32| ((full.0 * scale).round() as u32, (full.1 * scale).round() as u32);
+
+            let (w, h) = size(sharp);
+            self.still.resize(w, h);
+            let (canvas, hits) = self.still.compose(&self.images, pos, count);
             self.hits = hits;
             self.covers_area = area;
-            self.px_per_cell = font.width as f32 * scale;
-            if let Some(row) = self.encode(canvas, area) {
+            self.px_per_cell = fw * sharp;
+
+            let row = if still || cheap || !kitty {
+                self.encode(canvas, area)
+            } else {
+                // moving, through a multiplexer that slows down with every
+                // pixel: the middle sharp, the folded sides from a smaller
+                // render
+                let soft = (MOTION_WIDTH / full.0).min(1.0);
+                let (sw, sh) = size(soft);
+                self.motion.resize(sw, sh);
+                let (small, _) = self.motion.compose(&self.images, pos, count);
+                // the centre cover, with a cell to spare each side
+                let middle = ((h as f32 / (fw * sharp)).ceil() as u16 + 2).min(area.width);
+                let left = (area.width - middle) / 2;
+                let cut = |image: &image::RgbaImage, scale: f32, from: u16, to: u16| {
+                    let x0 = (from as f32 * fw * scale).round() as u32;
+                    let x1 = ((to as f32 * fw * scale).round() as u32).min(image.width());
+                    image::imageops::crop_imm(image, x0, 0, x1.saturating_sub(x0), image.height()).to_image()
+                };
+                let parts = [
+                    (cut(&small, soft, 0, left), Rect { width: left, ..area }),
+                    (cut(&canvas, sharp, left, left + middle), Rect { x: area.x + left, width: middle, ..area }),
+                    (
+                        cut(&small, soft, left + middle, area.width),
+                        Rect { x: area.x + left + middle, width: area.width - left - middle, ..area },
+                    ),
+                ];
+                self.flip ^= 1;
+                let ids = self.kitty_ids[self.flip];
+                Some(Row::Kitty(
+                    parts
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, (image, rect))| rect.width > 0 && image.width() > 0)
+                        .map(|(k, (image, rect))| {
+                            let picture = kitty::Picture::new(&image, ids + k as u32, rect.width, rect.height, &self.medium);
+                            (picture, rect)
+                        })
+                        .collect(),
+                ))
+            };
+            if let Some(row) = row {
                 self.frame = Some((row, pos, area, still));
             }
             self.stale = false;
         }
         match &self.frame {
-            Some((Row::Kitty(picture), ..)) => frame.render_widget(picture, area),
+            Some((Row::Kitty(pictures), ..)) => {
+                for (picture, rect) in pictures {
+                    frame.render_widget(picture, *rect);
+                }
+            }
             Some((Row::Other(protocol), ..)) => frame.render_widget(Image::new(protocol), area),
             None => {}
         }
     }
 
-    /// The row image for the terminal. With kitty graphics it goes to one of
-    /// two fixed image ids in turn: re-sending an id replaces its picture
-    /// instead of piling up new ones in the terminal.
+    /// The row as one image for the terminal. With kitty graphics it goes to
+    /// one of two fixed sets of image ids in turn: re-sending an id replaces
+    /// its picture instead of piling up new ones in the terminal.
     fn encode(&mut self, canvas: image::RgbaImage, area: Rect) -> Option<Row> {
         if self.picker.protocol_type() == ProtocolType::Kitty {
             self.flip ^= 1;
             let id = self.kitty_ids[self.flip];
-            Some(Row::Kitty(kitty::Picture::new(&canvas, id, area.width, area.height, &self.medium)))
+            let picture = kitty::Picture::new(&canvas, id, area.width, area.height, &self.medium);
+            Some(Row::Kitty(vec![(picture, area)]))
         } else {
             let image = DynamicImage::ImageRgba8(canvas);
             self.picker.new_protocol(image, area.into(), Resize::Fit(None)).ok().map(Row::Other)
