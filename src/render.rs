@@ -224,7 +224,8 @@ mod bench {
         let img = image::open(list.split(':').next().unwrap()).unwrap();
         let covers = (0..30).map(|i| (i, Some(img.clone()))).collect();
         let mut scene = super::Scene::default();
-        scene.resize(1000, 250);
+        let (w, h): (u32, u32) = std::env::var("BENCH_SIZE").ok().and_then(|s| { let (a, b) = s.split_once("x")?; Some((a.parse().ok()?, b.parse().ok()?)) }).unwrap_or((900, 225));
+        scene.resize(w, h);
         scene.compose(&covers, 10.0, 30);
         let t = std::time::Instant::now();
         let mut bytes = 0;

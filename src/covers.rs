@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-const THUMB_SIZE: u32 = 600;
+const THUMB_SIZE: u32 = 1000;
 const NAMES: [&str; 6] = ["cover.jpg", "cover.png", "folder.jpg", "Folder.jpg", "front.jpg", "Front.jpg"];
 
 pub struct Loaded {
@@ -47,7 +47,7 @@ impl Loader {
 fn cache_path(cache_dir: &Path, album_dir: &Path) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     album_dir.hash(&mut hasher);
-    cache_dir.join(format!("{:016x}.png", hasher.finish()))
+    cache_dir.join(format!("{:016x}-{THUMB_SIZE}.png", hasher.finish()))
 }
 
 fn load(cache_dir: &Path, album_dir: &Path) -> Option<DynamicImage> {

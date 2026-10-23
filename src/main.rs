@@ -40,9 +40,12 @@ const GLIDE: Duration = Duration::from_millis(350);
 const MAX_GLIDE: f32 = 5.0;
 /// Fastest a scroll wheel or trackpad flips: one album per this long
 const SCROLL_STEP: Duration = Duration::from_millis(60);
-/// Widest the row is rendered, in pixels; the terminal scales it up. Keeps
-/// each frame small enough to send ~30 times a second
-const MAX_CANVAS_WIDTH: f32 = 900.0;
+/// Widest the row is rendered while it moves, in pixels; the terminal scales
+/// it up. Keeps each frame small enough to send ~30 times a second. Once it
+/// stops it's rendered once more at the pane's full resolution
+const MOTION_WIDTH: f32 = 900.0;
+/// Widest a still frame is rendered
+const STILL_WIDTH: f32 = 3200.0;
 /// How far around the selection covers are loaded ahead of time
 const PREFETCH: usize = render::MAX_SIDE + 2;
 /// Covers further than this from the selection are dropped from memory
@@ -99,9 +102,12 @@ struct App {
     /// Loaded covers; None when an album has none
     images: HashMap<usize, Option<DynamicImage>>,
     requested: HashSet<usize>,
-    scene: render::Scene,
-    /// The row as last rendered, and what it was rendered for
-    frame: Option<(Row, f32, Rect)>,
+    /// Two sizes of the row, so switching between them doesn't rescale
+    /// every cover: small while it moves, full resolution when it stops
+    motion: render::Scene,
+    still: render::Scene,
+    /// The row as last rendered, and what for: position, area, still or not
+    frame: Option<(Row, f32, Rect, bool)>,
     /// Something besides the position changed (a cover arrived): re-render
     stale: bool,
     /// Two image ids, used in turn, so a frame is never shown half-sent
@@ -152,7 +158,8 @@ fn main() -> Result<()> {
         loader: covers::Loader::spawn(cache_dir),
         images: HashMap::new(),
         requested: HashSet::new(),
-        scene: render::Scene::default(),
+        motion: render::Scene::default(),
+        still: render::Scene::default(),
         frame: None,
         stale: true,
         kitty_ids: [base, base + 1],
@@ -231,7 +238,8 @@ impl App {
             }
             while let Ok(loaded) = self.loader.results.try_recv() {
                 self.images.insert(loaded.index, loaded.image);
-                self.scene.forget(loaded.index);
+                self.motion.forget(loaded.index);
+                self.still.forget(loaded.index);
                 self.stale = true;
             }
             // a new selection: glide there from wherever the row is now
@@ -422,7 +430,8 @@ impl App {
         for i in far {
             self.images.remove(&i);
             self.requested.remove(&i);
-            self.scene.forget(i);
+            self.motion.forget(i);
+            self.still.forget(i);
         }
     }
 
@@ -467,20 +476,23 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let fresh = matches!(&self.frame, Some((_, p, a)) if *p == pos && *a == area);
+        let still = self.glide.done();
+        let fresh = matches!(&self.frame, Some((_, p, a, s)) if *p == pos && *a == area && *s == still);
         if !fresh || self.stale {
             let font = self.picker.font_size();
             let full_width = area.width as f32 * font.width as f32;
-            let scale = (MAX_CANVAS_WIDTH / full_width).min(1.0);
+            let max_width = if still { STILL_WIDTH } else { MOTION_WIDTH };
+            let scale = (max_width / full_width).min(1.0);
             let width = (full_width * scale).round() as u32;
             let height = (area.height as f32 * font.height as f32 * scale).round() as u32;
-            self.scene.resize(width, height);
-            let (canvas, hits) = self.scene.compose(&self.images, pos, count);
+            let scene = if still { &mut self.still } else { &mut self.motion };
+            scene.resize(width, height);
+            let (canvas, hits) = scene.compose(&self.images, pos, count);
             self.hits = hits;
             self.covers_area = area;
             self.px_per_cell = font.width as f32 * scale;
             if let Some(row) = self.encode(canvas, area) {
-                self.frame = Some((row, pos, area));
+                self.frame = Some((row, pos, area, still));
             }
             self.stale = false;
         }
