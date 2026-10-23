@@ -2,26 +2,29 @@
 //! in the terminal. Plays alongside any other MPD client (rmpc, ncmpcpp…).
 
 mod covers;
-mod fold;
 mod library;
 mod mpd;
+mod render;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
-use fold::Facing;
 use image::DynamicImage;
 use library::Album;
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Rect, Size},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Paragraph, Wrap},
+    widgets::Paragraph,
 };
-use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{
+    Image, Resize,
+    picker::{Capability, Picker, ProtocolType},
+    protocol::{Protocol, kitty::Kitty},
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
@@ -29,14 +32,18 @@ use std::time::{Duration, Instant};
 
 const HELP: &str =
     "h/l ←/→ scroll flip · H/L ±10 · g/G ends · / search · c playing · ⏎ play · a add · q quit";
-/// Height of the folded side covers compared with the centre one
-const SIDE_HEIGHT: f32 = 0.86;
-/// Most folded covers drawn on each side
-const MAX_SIDE: usize = 8;
+/// How long the row takes to glide to a new album
+const GLIDE: Duration = Duration::from_millis(350);
+/// Further than this, a jump (search, g/G) starts its glide this close to
+/// the target instead of racing past hundreds of covers
+const MAX_GLIDE: f32 = 5.0;
 /// Fastest a scroll wheel or trackpad flips: one album per this long
 const SCROLL_STEP: Duration = Duration::from_millis(60);
+/// Widest the row is rendered, in pixels; the terminal scales it up. Keeps
+/// each frame small enough to send ~30 times a second
+const MAX_CANVAS_WIDTH: f32 = 1400.0;
 /// How far around the selection covers are loaded ahead of time
-const PREFETCH: usize = MAX_SIDE + 2;
+const PREFETCH: usize = render::MAX_SIDE + 2;
 /// Covers further than this from the selection are dropped from memory
 const KEEP: usize = 40;
 
@@ -47,16 +54,28 @@ struct Options {
     list: bool,
 }
 
-/// How a cover is shown: flat in the centre, or folded n places out
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum View {
-    Flat,
-    Folded(Facing, usize),
-}
-
 enum Mode {
     Browse,
     Search { query: String, from: usize },
+}
+
+/// The row's glide towards the selection: an ease-out from `from` to `to`
+struct Glide {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+impl Glide {
+    fn pos(&self) -> f32 {
+        let t = (self.start.elapsed().as_secs_f32() / GLIDE.as_secs_f32()).min(1.0);
+        let ease = 1.0 - (1.0 - t).powi(3);
+        self.from + (self.to - self.from) * ease
+    }
+
+    fn done(&self) -> bool {
+        self.start.elapsed() >= GLIDE
+    }
 }
 
 struct App {
@@ -65,18 +84,26 @@ struct App {
     albums: Option<Vec<Album>>,
     library_rx: Receiver<Result<Vec<Album>>>,
     selected: usize,
+    glide: Glide,
     mode: Mode,
     last_query: Option<String>,
     loader: covers::Loader,
     /// Loaded covers; None when an album has none
     images: HashMap<usize, Option<DynamicImage>>,
-    /// Encoded images per album and how it's shown; re-encoded only when
-    /// their size changes
-    protocols: HashMap<(usize, View), StatefulProtocol>,
-    /// Where each cover was drawn last, for mouse clicks
-    hits: Vec<(Rect, usize)>,
-    last_scroll: Instant,
     requested: HashSet<usize>,
+    scene: render::Scene,
+    /// The row as last rendered, and what it was rendered for
+    frame: Option<(Protocol, f32, Rect)>,
+    /// Something besides the position changed (a cover arrived): re-render
+    stale: bool,
+    /// Two image ids, used in turn, so a frame is never shown half-sent
+    kitty_ids: [u32; 2],
+    flip: usize,
+    /// Where each cover was drawn, in canvas pixels, and the canvas scale
+    hits: Vec<render::Hit>,
+    covers_area: Rect,
+    px_per_cell: f32,
+    last_scroll: Instant,
     status: Option<String>,
 }
 
@@ -103,20 +130,29 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // ask the terminal how it draws images (kitty, sixel…) and its cell size
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // kitty image ids are 24 bits plus a high byte; keep them small and ours
+    let base = (std::process::id() % 0x7f_ff00) + 0x100;
     let mut app = App {
         options,
         picker,
         albums: None,
         library_rx,
         selected: 0,
+        glide: Glide { from: 0.0, to: 0.0, start: Instant::now() },
         mode: Mode::Browse,
         last_query: None,
         loader: covers::Loader::spawn(cache_dir),
         images: HashMap::new(),
-        protocols: HashMap::new(),
-        hits: Vec::new(),
-        last_scroll: Instant::now(),
         requested: HashSet::new(),
+        scene: render::Scene::default(),
+        frame: None,
+        stale: true,
+        kitty_ids: [base, base + 1],
+        flip: 0,
+        hits: Vec::new(),
+        covers_area: Rect::default(),
+        px_per_cell: 1.0,
+        last_scroll: Instant::now(),
         status: None,
     };
     crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
@@ -182,20 +218,35 @@ impl App {
             {
                 self.albums = Some(result?);
                 self.jump_to_playing();
+                let at = self.selected as f32;
+                self.glide = Glide { from: at, to: at, start: Instant::now() - GLIDE };
             }
             while let Ok(loaded) = self.loader.results.try_recv() {
                 self.images.insert(loaded.index, loaded.image);
-                self.protocols.retain(|(i, _), _| *i != loaded.index);
+                self.scene.forget(loaded.index);
+                self.stale = true;
+            }
+            // a new selection: glide there from wherever the row is now
+            let target = self.selected as f32;
+            if target != self.glide.to {
+                let mut from = self.glide.pos();
+                if (target - from).abs() > MAX_GLIDE {
+                    from = target - MAX_GLIDE.copysign(target - from);
+                }
+                self.glide = Glide { from, to: target, start: Instant::now() };
             }
             self.prefetch();
             terminal.draw(|frame| self.draw(frame))?;
 
-            if event::poll(Duration::from_millis(80))? {
+            // ~30 frames a second while gliding; otherwise wait for input
+            let wait = if self.glide.done() { 100 } else { 33 };
+            if event::poll(Duration::from_millis(wait))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press && !self.handle_key(key) => {
                         return Ok(());
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Resize(..) => self.stale = true,
                     _ => {}
                 }
             }
@@ -284,11 +335,14 @@ impl App {
             MouseEventKind::ScrollRight | MouseEventKind::ScrollDown => 1,
             MouseEventKind::ScrollLeft | MouseEventKind::ScrollUp => -1,
             MouseEventKind::Down(MouseButton::Left) => {
-                let hit = self.hits.iter().find(|(r, _)| {
-                    (r.x..r.x + r.width).contains(&mouse.column) && (r.y..r.y + r.height).contains(&mouse.row)
-                });
-                if let Some(&(_, index)) = hit {
-                    self.selected = index;
+                let a = self.covers_area;
+                if !(a.y..a.y + a.height).contains(&mouse.row) {
+                    return;
+                }
+                let x = (mouse.column.saturating_sub(a.x) as f32 + 0.5) * self.px_per_cell;
+                // the cover drawn last is on top
+                if let Some(hit) = self.hits.iter().rev().find(|h| (h.left..h.right).contains(&x)) {
+                    self.selected = hit.index;
                 }
                 return;
             }
@@ -360,8 +414,8 @@ impl App {
         for i in far {
             self.images.remove(&i);
             self.requested.remove(&i);
+            self.scene.forget(i);
         }
-        self.protocols.retain(|(i, _), _| i.abs_diff(selected) <= KEEP);
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -376,91 +430,70 @@ impl App {
             return;
         }
 
-        // three text lines under the covers, a blank line between
+        // the row of covers, then a blank line and three lines of text
         let text_height = 3.min(area.height);
         let covers = Rect { height: area.height.saturating_sub(text_height + 1), ..area };
-        let font = self.picker.font_size();
-        // a square cover is this many cells wide per cell of height
-        let aspect = font.height as f32 / font.width.max(1) as f32;
+        let pos = self.glide.pos();
+        self.draw_row(frame, covers, pos, albums.len());
 
-        let mut rows = covers.height;
-        let mut cols = (rows as f32 * aspect).round() as u16;
-        if cols > covers.width * 45 / 100 {
-            cols = covers.width * 45 / 100;
-            rows = (cols as f32 / aspect).round() as u16;
-        }
-        if rows == 0 || cols == 0 {
-            return;
-        }
-        let center_x = covers.x + (covers.width - cols) / 2;
-        let top = covers.y + (covers.height - rows) / 2;
-        self.hits.clear();
-        self.draw_cover(frame, self.selected, Rect::new(center_x, top, cols, rows), View::Flat);
-
-        // neighbours folded towards the centre, stacked outwards, as many as fit
-        let side_rows = ((rows as f32) * SIDE_HEIGHT).round().max(1.0) as u16;
-        let side_cols = ((side_rows as f32) * aspect * fold::SQUEEZE).round().max(1.0) as u16;
-        let y = top + (rows - side_rows) / 2;
-        let gap = 2;
-        for depth in 1..=MAX_SIDE {
-            let offset = gap + (depth as u16 - 1) * side_cols;
-            if let Some(i) = self.selected.checked_sub(depth)
-                && center_x >= covers.x + offset + side_cols
-            {
-                let x = center_x - offset - side_cols;
-                let view = View::Folded(Facing::Right, depth);
-                self.draw_cover(frame, i, Rect::new(x, y, side_cols, side_rows), view);
-            }
-            let i = self.selected + depth;
-            let x = center_x + cols + offset;
-            if i < albums.len() && x + side_cols <= covers.x + covers.width {
-                let view = View::Folded(Facing::Left, depth);
-                self.draw_cover(frame, i, Rect::new(x, y, side_cols, side_rows), view);
-            }
-        }
-
-        // title, artist · year, then position / search / status
-        let album = &albums[self.selected];
-        let year = if album.year.is_empty() { String::new() } else { format!(" · {}", album.year) };
+        // the album nearest the centre: the title changes as covers arrive
+        let shown = &albums[(pos.round() as usize).min(albums.len() - 1)];
+        let year = if shown.year.is_empty() { String::new() } else { format!(" · {}", shown.year) };
         let bottom = match (&self.mode, &self.status) {
             (Mode::Search { query, .. }, _) => Line::from(format!("/{query}▏")),
             (_, Some(status)) => Line::from(status.clone()),
             _ => Line::from(format!("{} / {}   {HELP}", self.selected + 1, albums.len())).dim(),
         };
         let lines = vec![
-            Line::from(Span::styled(album.title.clone(), Style::new().add_modifier(Modifier::BOLD))),
-            Line::from(vec![Span::styled(album.artist.clone(), Style::new().fg(Color::Blue)), Span::raw(year)]),
+            Line::from(Span::styled(shown.title.clone(), Style::new().add_modifier(Modifier::BOLD))),
+            Line::from(vec![Span::styled(shown.artist.clone(), Style::new().fg(Color::Blue)), Span::raw(year)]),
             bottom,
         ];
         let text_area = Rect { y: area.y + area.height - text_height, height: text_height, ..area };
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), text_area);
     }
 
-    fn draw_cover(&mut self, frame: &mut Frame, index: usize, area: Rect, view: View) {
-        self.hits.push((area, index));
-        if let Some(Some(image)) = self.images.get(&index) {
-            let picker = &self.picker;
-            let protocol = self.protocols.entry((index, view)).or_insert_with(|| {
-                let image = match view {
-                    View::Flat => image.clone(),
-                    // darker the further out
-                    View::Folded(facing, depth) => {
-                        fold::fold(image, facing, (0.85 - 0.08 * (depth - 1) as f32).max(0.35))
-                    }
-                };
-                picker.new_resize_protocol(image)
-            });
-            frame.render_stateful_widget(StatefulImage::default(), area, protocol);
+    /// Renders the row as one image when it moved (or a cover arrived), and
+    /// places it; otherwise places the last one again, which costs nothing.
+    fn draw_row(&mut self, frame: &mut Frame, area: Rect, pos: f32, count: usize) {
+        if area.width == 0 || area.height == 0 {
             return;
         }
-        // no cover (or not loaded yet): a frame, with the title once we know there's none
-        let title = match self.images.get(&index) {
-            Some(None) => self.albums.as_ref().map(|a| a[index].title.clone()).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let style = if view == View::Flat { Style::new() } else { Style::new().dim() };
-        let block = Block::bordered().border_type(BorderType::Rounded).style(style);
-        let text = Paragraph::new(title).block(block).alignment(Alignment::Center).wrap(Wrap { trim: true });
-        frame.render_widget(text, area);
+        let fresh = matches!(&self.frame, Some((_, p, a)) if *p == pos && *a == area);
+        if !fresh || self.stale {
+            let font = self.picker.font_size();
+            let full_width = area.width as f32 * font.width as f32;
+            let scale = (MAX_CANVAS_WIDTH / full_width).min(1.0);
+            let width = (full_width * scale).round() as u32;
+            let height = (area.height as f32 * font.height as f32 * scale).round() as u32;
+            self.scene.resize(width, height);
+            let (canvas, hits) = self.scene.compose(&self.images, pos, count);
+            self.hits = hits;
+            self.covers_area = area;
+            self.px_per_cell = font.width as f32 * scale;
+            if let Some(protocol) = self.protocol(DynamicImage::ImageRgba8(canvas), area) {
+                self.frame = Some((protocol, pos, area));
+            }
+            self.stale = false;
+        }
+        if let Some((protocol, ..)) = &self.frame {
+            frame.render_widget(Image::new(protocol), area);
+        }
+    }
+
+    /// The row image for the terminal. With kitty graphics it goes to one of
+    /// two fixed image ids in turn: re-sending an id replaces its picture
+    /// instead of piling up new ones in the terminal.
+    fn protocol(&mut self, image: DynamicImage, area: Rect) -> Option<Protocol> {
+        if self.picker.protocol_type() == ProtocolType::Kitty {
+            self.flip ^= 1;
+            let compress = self.picker.capabilities().contains(&Capability::KittyCompression);
+            let size = Size::new(area.width, area.height);
+            Kitty::new(image, size, self.kitty_ids[self.flip], self.picker.tmux_detected(), compress)
+                .ok()
+                .map(Protocol::Kitty)
+        } else {
+            self.picker.new_protocol(image, area.into(), Resize::Fit(None)).ok()
+        }
     }
 }
