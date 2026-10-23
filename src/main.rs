@@ -41,9 +41,11 @@ const MAX_GLIDE: f32 = 5.0;
 /// Fastest a scroll wheel or trackpad flips: one album per this long
 const SCROLL_STEP: Duration = Duration::from_millis(60);
 /// Widest the row is rendered while it moves, in pixels; the terminal scales
-/// it up. Keeps each frame small enough to send ~30 times a second. Once it
-/// stops it's rendered once more at the pane's full resolution
-const MOTION_WIDTH: f32 = 900.0;
+/// it up (blockily, so not by much). Once it stops it's rendered once more at
+/// the pane's full resolution
+const MOTION_WIDTH: f32 = 1600.0;
+/// Time per frame while the row moves, at most
+const FRAME: Duration = Duration::from_millis(33);
 /// Widest a still frame is rendered
 const STILL_WIDTH: f32 = 3200.0;
 /// How far around the selection covers are loaded ahead of time
@@ -252,11 +254,18 @@ impl App {
                 self.glide = Glide { from, to: target, start: Instant::now() };
             }
             self.prefetch();
+            let frame_start = Instant::now();
             terminal.draw(|frame| self.draw(frame))?;
 
-            // ~30 frames a second while gliding; otherwise wait for input
-            let wait = if self.glide.done() { 100 } else { 33 };
-            if event::poll(Duration::from_millis(wait))? {
+            // up to ~30 frames a second while gliding, fewer when the
+            // terminal takes longer to swallow one (the glide keeps its
+            // timing either way); otherwise wait for input
+            let wait = if self.glide.done() {
+                Duration::from_millis(100)
+            } else {
+                FRAME.saturating_sub(frame_start.elapsed())
+            };
+            if event::poll(wait)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press && !self.handle_key(key) => {
                         return Ok(());
