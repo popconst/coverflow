@@ -181,22 +181,24 @@ fn draw(canvas: &mut RgbaImage, source: &RgbaImage, p: Placement) {
         // the source columns this canvas column spans, averaged
         let s0 = ((x as f32 - p.left) / p.w * sw).clamp(0.0, sw - 1.0);
         let s1 = ((x as f32 + 1.0 - p.left) / p.w * sw).clamp(s0 + 1.0, sw);
-        let (c0, c1) = (s0 as u32, (s1.ceil() as u32).min(source.width()));
+        let (c0, c1) = (s0 as usize, (s1.ceil() as usize).min(source.width() as usize));
+        let n = (c1 - c0).max(1) as f32;
+        let stride = source.width() as usize * 4;
         column.clear();
-        for sy in 0..source.height() {
+        column.extend(source.as_raw().chunks_exact(stride).map(|row| {
             let mut sum = [0.0f32; 3];
-            for sx in c0..c1 {
-                let Rgba([r, g, b, _]) = *source.get_pixel(sx, sy);
-                sum[0] += r as f32;
-                sum[1] += g as f32;
-                sum[2] += b as f32;
+            for px in row[c0 * 4..c1 * 4].chunks_exact(4) {
+                sum[0] += px[0] as f32;
+                sum[1] += px[1] as f32;
+                sum[2] += px[2] as f32;
             }
-            let n = (c1 - c0).max(1) as f32;
-            column.push(sum.map(|v| v / n));
-        }
+            sum.map(|v| v / n)
+        }));
 
         let y0 = top.floor() as i64;
         let y1 = (top + col_h).ceil() as i64;
+        let canvas_stride = cw as usize * 4;
+        let pixels: &mut [u8] = canvas;
         for y in y0.max(0)..y1.min(ch) {
             let vcov = ((y as f32 + 1.0).min(top + col_h) - (y as f32).max(top)).clamp(0.0, 1.0);
             let alpha = coverage * vcov;
@@ -219,10 +221,12 @@ fn draw(canvas: &mut RgbaImage, source: &RgbaImage, p: Placement) {
                 let b = (a + 1).min(column.len() - 1);
                 [0, 1, 2].map(|i| column[a][i] * (1.0 - f) + column[b][i] * f)
             };
-            let under = *canvas.get_pixel(x as u32, y as u32);
-            let mix = |c: f32, u: u8| (c * shade * alpha + u as f32 * (1.0 - alpha)).round() as u8;
-            let a = (255.0 * alpha + under[3] as f32 * (1.0 - alpha)).round() as u8;
-            canvas.put_pixel(x as u32, y as u32, Rgba([mix(rgb[0], under[0]), mix(rgb[1], under[1]), mix(rgb[2], under[2]), a]));
+            let at = y as usize * canvas_stride + x as usize * 4;
+            let under = &mut pixels[at..at + 4];
+            for i in 0..3 {
+                under[i] = (rgb[i] * shade * alpha + under[i] as f32 * (1.0 - alpha)).round() as u8;
+            }
+            under[3] = (255.0 * alpha + under[3] as f32 * (1.0 - alpha)).round() as u8;
         }
     }
 }
@@ -268,7 +272,7 @@ mod bench {
         for k in 0..20 {
             let (c, _) = scene.compose(&covers, 10.0 + k as f32 * 0.05, 30);
             let t2 = std::time::Instant::now();
-            let p = crate::kitty::Picture::new(&c, 1, 100, 25, true);
+            let p = crate::kitty::Picture::new(&c, 1, 100, 25, &crate::kitty::Medium::TempFile(std::env::temp_dir()));
             bytes = p.len();
             if k == 0 { eprintln!("encode {:?}", t2.elapsed()); }
         }

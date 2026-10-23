@@ -94,6 +94,7 @@ enum Row {
 struct App {
     options: Options,
     picker: Picker,
+    medium: kitty::Medium,
     albums: Option<Vec<Album>>,
     library_rx: Receiver<Result<Vec<Album>>>,
     selected: usize,
@@ -146,11 +147,16 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     // ask the terminal how it draws images (kitty, sixel…) and its cell size
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let medium = match kitty::probe_temp_file() {
+        Some(dir) if picker.protocol_type() == ProtocolType::Kitty => kitty::Medium::TempFile(dir),
+        _ => kitty::Medium::Direct { compress: picker.capabilities().contains(&Capability::KittyCompression) },
+    };
     // kitty image ids are 24 bits plus a high byte; keep them small and ours
     let base = (std::process::id() % 0x7f_ff00) + 0x100;
     let mut app = App {
         options,
         picker,
+        medium,
         albums: None,
         library_rx,
         selected: 0,
@@ -490,7 +496,9 @@ impl App {
         if !fresh || self.stale {
             let font = self.picker.font_size();
             let full_width = area.width as f32 * font.width as f32;
-            let max_width = if still { STILL_WIDTH } else { MOTION_WIDTH };
+            // frames sent as files cost the terminal nothing to pass on
+            let full_motion = matches!(self.medium, kitty::Medium::TempFile(_));
+            let max_width = if still || full_motion { STILL_WIDTH } else { MOTION_WIDTH };
             let scale = (max_width / full_width).min(1.0);
             let width = (full_width * scale).round() as u32;
             let height = (area.height as f32 * font.height as f32 * scale).round() as u32;
@@ -518,9 +526,8 @@ impl App {
     fn encode(&mut self, canvas: image::RgbaImage, area: Rect) -> Option<Row> {
         if self.picker.protocol_type() == ProtocolType::Kitty {
             self.flip ^= 1;
-            let compress = self.picker.capabilities().contains(&Capability::KittyCompression);
             let id = self.kitty_ids[self.flip];
-            Some(Row::Kitty(kitty::Picture::new(&canvas, id, area.width, area.height, compress)))
+            Some(Row::Kitty(kitty::Picture::new(&canvas, id, area.width, area.height, &self.medium)))
         } else {
             let image = DynamicImage::ImageRgba8(canvas);
             self.picker.new_protocol(image, area.into(), Resize::Fit(None)).ok().map(Row::Other)

@@ -2,6 +2,10 @@
 //! image stretched over a block of cells (unicode placeholders, so it works
 //! through multiplexers like herdr). ratatui-image's sender leaves out the
 //! block's size, so the terminal shows the image at its pixel size instead.
+//!
+//! Where the terminal can read files (kitty, Ghostty), a frame goes as a
+//! temporary file: only its path passes through the terminal (and herdr),
+//! so full-resolution frames can be sent ~30 times a second.
 
 use flate2::{Compression, write::ZlibEncoder};
 use image::RgbaImage;
@@ -11,10 +15,74 @@ use ratatui::{
     style::Color,
     widgets::Widget,
 };
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// How frames get to the terminal
+#[derive(Clone)]
+pub enum Medium {
+    /// In the escape codes themselves, deflated when the terminal takes that
+    Direct { compress: bool },
+    /// As temporary files in this folder, which the terminal reads and deletes
+    TempFile(PathBuf),
+}
+
+/// Asks the terminal whether it reads images from temporary files in the
+/// system's temp folder, or /tmp. Needs raw mode; run once at start-up.
+pub fn probe_temp_file() -> Option<PathBuf> {
+    let dirs = [std::env::temp_dir(), PathBuf::from("/tmp")];
+    let mut query = String::new();
+    let mut probes = Vec::new();
+    for (n, dir) in dirs.iter().enumerate() {
+        // a 1×1 RGB image
+        let path = temp_path(dir);
+        std::fs::write(&path, [0u8; 3]).ok()?;
+        probes.push(path.clone());
+        let payload = base64_simd::STANDARD.encode_to_string(path.to_string_lossy().as_bytes());
+        query.push_str(&format!("\x1b_Gi={},s=1,v=1,a=q,t=t,f=24;{payload}\x1b\\", 0x7f_fff0 + n));
+    }
+    // device attributes: every terminal answers, so we know when to stop
+    query.push_str("\x1b[c");
+    let mut out = std::io::stdout();
+    out.write_all(query.as_bytes()).ok()?;
+    out.flush().ok()?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reply = Vec::new();
+        let mut byte = [0u8; 1];
+        while std::io::stdin().read(&mut byte).is_ok_and(|n| n == 1) {
+            reply.push(byte[0]);
+            // the device attributes answer ends the reply: ESC [ ? … c
+            if byte[0] == b'c' && reply.windows(3).any(|w| w == b"\x1b[?") {
+                break;
+            }
+        }
+        let _ = tx.send(reply);
+    });
+    let reply = rx.recv_timeout(Duration::from_secs(2));
+    // the terminal deletes the ones it read
+    for path in probes {
+        let _ = std::fs::remove_file(path);
+    }
+    let reply = String::from_utf8_lossy(&reply.ok()?).into_owned();
+    dirs.into_iter()
+        .enumerate()
+        .find(|(n, _)| reply.contains(&format!("i={};OK", 0x7f_fff0 + n)))
+        .map(|(_, dir)| dir)
+}
+
+/// The terminal only reads temporary files with this in their name
+fn temp_path(dir: &Path) -> PathBuf {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("coverflow-tty-graphics-protocol-{}-{n}.rgba", std::process::id()))
+}
 
 /// An image ready to place: sent with the first cell drawn, then only the
 /// placeholder cells
@@ -27,9 +95,23 @@ pub struct Picture {
 
 impl Picture {
     /// Encodes `image` under image `id` (replacing what the id showed),
-    /// stretched over `cols` × `rows` cells; deflated when the terminal
-    /// takes that
-    pub fn new(image: &RgbaImage, id: u32, cols: u16, rows: u16, compress: bool) -> Self {
+    /// stretched over `cols` × `rows` cells
+    pub fn new(image: &RgbaImage, id: u32, cols: u16, rows: u16, medium: &Medium) -> Self {
+        let (w, h) = image.dimensions();
+        let compress = match medium {
+            Medium::TempFile(dir) => {
+                let path = temp_path(dir);
+                if std::fs::write(&path, image.as_raw()).is_ok() {
+                    let payload = base64_simd::STANDARD.encode_to_string(path.to_string_lossy().as_bytes());
+                    let transmit = format!(
+                        "\x1b_Gq=2,i={id},a=T,U=1,f=32,t=t,s={w},v={h},c={cols},r={rows};{payload}\x1b\\"
+                    );
+                    return Picture { id, cols, rows, transmit: std::cell::Cell::new(Some(transmit)) };
+                }
+                true
+            }
+            Medium::Direct { compress } => *compress,
+        };
         let bytes = if compress {
             // fast over small: a frame is sent ~30 times a second
             let mut zlib = ZlibEncoder::new(Vec::new(), Compression::fast());
@@ -40,7 +122,6 @@ impl Picture {
         };
         let compression = if compress { "o=z," } else { "" };
 
-        let (w, h) = image.dimensions();
         let mut transmit = String::with_capacity(bytes.len() * 4 / 3 + bytes.len() / 3000 * 16 + 100);
         let chunks: Vec<&[u8]> = bytes.chunks(3072).collect();
         for (i, chunk) in chunks.iter().enumerate() {
